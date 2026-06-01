@@ -31,7 +31,6 @@ logging.basicConfig(level=logging.INFO)
 
 @record
 def main() -> None:
-    REPLICA_GROUP_ID = int(os.environ.get("REPLICA_GROUP_ID", 0))
     RUN = int(os.environ.get("RUN", 0))
 
     output_folder = f"output/replica-{REPLICA_GROUP_ID}"

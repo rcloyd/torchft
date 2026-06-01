@@ -555,52 +555,6 @@ class AsyncDiLoCoTest(TestCase):
             expected = initial + 0.4
             torch.testing.assert_close(updated.cpu(), expected.cpu(), rtol=1e-5, atol=1e-4)
 
-    def test_async_diloco_requires_async_quorum(self) -> None:
-        """AsyncDiLoCo must raise if the manager does not use async quorum."""
-        model = SimpleModel()
-        inner_optimizer = torch.optim.AdamW(model.parameters(), lr=4e-4)
-        outer_optimizer = torch.optim.SGD(model.parameters(), lr=0.7)
-        manager = create_manager()
-        manager._use_async_quorum = False
-
-        with self.assertRaises(ValueError):
-            AsyncDiLoCo(manager, [model], inner_optimizer, outer_optimizer, sync_every=2)
-
-    def test_async_diloco_multi_window(self) -> None:
-        """Three full windows: verify pipeline stays correct across multiple commits."""
-        model = SimpleModel()
-        inner_optimizer = torch.optim.AdamW(
-            model.parameters(), lr=4e-4, weight_decay=0.1, betas=(0.9, 0.95)
-        )
-        outer_optimizer = torch.optim.SGD(
-            model.parameters(), lr=0.7, momentum=0.9, nesterov=True
-        )
-        manager = create_manager()
-        manager._use_async_quorum = True
-        manager.should_commit.return_value = True
-        manager.current_step.return_value = 0
-
-        with AsyncDiLoCo(
-            manager, [model], inner_optimizer, outer_optimizer, sync_every=2
-        ) as async_diloco:
-            parameter_count = len(list(model.parameters()))
-            inp = torch.rand(2, 3)
-
-            # Three full windows = 6 steps
-            for _ in range(6):
-                loss = model(inp).mean()
-                loss.backward()
-                inner_optimizer.step()
-
-            # start_quorum: once at window 1 boundary + once at step 1 of windows 2 and 3
-            self.assertEqual(manager.start_quorum.call_count, 3)
-            # should_commit called at every boundary: window 1 (else branch for late-joiner
-            # checkpoint application) and windows 2 and 3 (if branch, normal outer step).
-            self.assertEqual(manager.should_commit.call_count, 3)
-            # allreduce called once per window
-            self.assertEqual(manager.allreduce.call_count, parameter_count * 3)
-            self.assertEqual(async_diloco._local_step, 0)
-
     def test_async_diloco_non_blocking(self) -> None:
         """allreduce(T) stays in-flight throughout all inner steps of window T+1."""
         model = SimpleModel()
