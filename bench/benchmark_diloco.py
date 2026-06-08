@@ -31,12 +31,17 @@ import sys
 sys.path.insert(0, "/home/rileycloyd/torchft")
 # torchtitan lives only in the symphony-learn venv
 sys.path.insert(1, "/home/rileycloyd/symphony-learn/.venv/lib/python3.10/site-packages")
+# User-installed packages (e.g. matplotlib 3.10 compatible with NumPy 2)
+# must come before the stale system matplotlib in /usr/lib/python3/dist-packages
+sys.path.insert(2, "/home/rileycloyd/.local/lib/python3.10/site-packages")
 
 import json
 import logging
+import math
 import os
 import time
 from datetime import timedelta
+from pathlib import Path
 
 # Read LOCAL_RANK / LOCAL_WORLD early — torchrun sets these before exec
 LOCAL_RANK = int(os.environ.get("LOCAL_RANK", 0))
@@ -48,7 +53,7 @@ REPLICA_GROUP_ID = int(os.environ.get("REPLICA_GROUP_ID", 0))
 # within that block. Do not override it here.
 os.environ["NCCL_HOSTID"] = str(REPLICA_GROUP_ID)
 
-MODE = os.environ.get("MODE", "diloco")          # "diloco" or "async_diloco"
+MODE = os.environ.get("MODE", "diloco")          # "diloco", "async_diloco", or "heloco"
 MODEL = os.environ.get("MODEL", "tiny")          # "tiny", "debugmodel", or "1B"
 USE_NCCL = os.getenv("USE_NCCL", "False") == "True"
 SLOW_MS = int(os.getenv("SLOW_MS", "0"))
@@ -58,7 +63,9 @@ NUM_OUTER_STEPS = int(os.getenv("NUM_OUTER_STEPS", "30"))
 SEQ_LEN = int(os.getenv("SEQ_LEN", "256"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "16"))
 SEED = int(os.getenv("SEED", "42"))
-DATA_PATH = os.getenv("DATA_PATH", "data/tinyshakespeare.txt")
+_BENCH_DIR = Path(__file__).parent
+DATA_PATH = os.getenv("DATA_PATH", str(_BENCH_DIR / "data" / "tinyshakespeare.txt"))
+NUM_REPLICAS = int(os.getenv("NUM_REPLICAS", "2"))
 
 import torch
 import torch.distributed as dist
@@ -68,11 +75,14 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed.elastic.multiprocessing.errors import record
 from torch.utils.tensorboard import SummaryWriter
 
-from torchtitan.models.llama3 import model_registry
+try:
+    from torchtitan.models.llama3 import model_registry
+except ImportError:
+    model_registry = None  # type: ignore[assignment]
 
 from torchft import Manager, ProcessGroupGloo, ProcessGroupNCCL
 from torchft.checkpointing.http_transport import HTTPTransport
-from torchft.local_sgd import AsyncDiLoCo, DiLoCo
+from torchft.local_sgd import AsyncDiLoCo, DiLoCo, HeLoCo
 
 logging.basicConfig(level=logging.INFO)
 
@@ -122,6 +132,8 @@ def make_model(device: torch.device) -> nn.Module:
     if MODEL == "tiny":
         VOCAB_SIZE = 256
         return _TinyModel(vocab=256).to(device)
+    if model_registry is None:
+        raise RuntimeError("torchtitan is required for non-tiny models; install it or set MODEL=tiny")
     _MODEL_SPEC = model_registry(MODEL)
     model = _MODEL_SPEC.model.build().to(device)
     VOCAB_SIZE = _MODEL_SPEC.model.vocab_size
@@ -136,7 +148,7 @@ def generate_batch(device: torch.device):
     data = _load_data()
     n = len(data)
     # Stagger starting position by replica so each island sees different data
-    base = (REPLICA_GROUP_ID * (n // 2) + _batch_offset) % (n - SEQ_LEN - 1)
+    base = (REPLICA_GROUP_ID * (n // NUM_REPLICAS) + _batch_offset) % (n - SEQ_LEN - 1)
     xs, ys = [], []
     for i in range(BATCH_SIZE):
         start = (base + i * SEQ_LEN) % (n - SEQ_LEN - 1)
@@ -165,10 +177,11 @@ def main() -> None:
 
     # Only LOCAL_RANK 0 writes metrics and owns the torchft Manager
     is_primary = LOCAL_RANK == 0
+    benchmark_outdir = Path(os.environ.get("BENCHMARK_OUTDIR", str(_BENCH_DIR / "output" / "benchmark")))
 
     if is_primary:
-        output_dir = f"output/benchmark/{MODE}/replica-{REPLICA_GROUP_ID}"
-        os.makedirs(output_dir, exist_ok=True)
+        output_dir = benchmark_outdir / MODE / f"replica-{REPLICA_GROUP_ID}"
+        output_dir.mkdir(parents=True, exist_ok=True)
         writer = SummaryWriter(f"{output_dir}/tensorboard", max_queue=1000)
 
     m = make_model(device)
@@ -178,6 +191,7 @@ def main() -> None:
         print(
             f"[replica-{REPLICA_GROUP_ID} rank-{LOCAL_RANK}] {MODE} | "
             f"model={MODEL} params={num_params:,} | "
+            f"data={DATA_PATH} | "
             f"gpus_per_island={LOCAL_WORLD} | "
             f"slow_ms={SLOW_MS if REPLICA_GROUP_ID == SLOW_REPLICA else 0}"
         )
@@ -191,9 +205,27 @@ def main() -> None:
     inner_optimizer = torch.optim.AdamW(
         m.parameters(), lr=4e-4, weight_decay=0.1, betas=(0.9, 0.95)
     )
-    outer_optimizer = torch.optim.SGD(
-        m.parameters(), lr=0.01, momentum=0.9, nesterov=False
+    # Outer lr: HeLoCo/MLA use 0.7 (paper default); diloco uses 0.7 with Nesterov;
+    # async_diloco uses 0.07. Apply sqrt(K)/K per-update weighting for all async
+    # modes (async DiLoCo paper, Table 3 / Appendix A.5).
+    _ASYNC_MODES = ("async_diloco", "heloco")
+    _HELOCO_LR = float(os.getenv("HELOCO_LR", "0.7"))
+    _SGD_LR = float(os.getenv("SGD_LR", "0.7" if MODE == "diloco" else "0.07"))
+    _outer_lr = _HELOCO_LR if MODE == "heloco" else _SGD_LR
+    if MODE in _ASYNC_MODES:
+        _outer_lr *= math.sqrt(NUM_REPLICAS) / NUM_REPLICAS  # = 1/sqrt(K)
+
+    # diloco/async_diloco use explicit outer SGD (Nesterov for diloco per the paper).
+    # mla/heloco_no_la/heloco build HeLoCoOptimizer internally via HeLoCo.
+    _uses_heloco_opt = MODE == "heloco"
+    outer_optimizer = (
+        None if _uses_heloco_opt
+        else torch.optim.SGD(
+            m.parameters(), lr=_outer_lr, momentum=0.9,
+            nesterov=True,
+        )
     )
+    outer_optimizer_ref = {"optimizer": outer_optimizer}
 
     # ── torchft Manager and DiLoCo — LOCAL_RANK 0 only ───────────────────────
     if is_primary:
@@ -203,22 +235,37 @@ def main() -> None:
             else ProcessGroupGloo(timeout=timedelta(seconds=300))
         )
         transport = HTTPTransport(timeout=timedelta(seconds=300), num_chunks=0)
+        # In async modes the manager calls disallow_checkpoint() immediately
+        # after each should_commit(), which holds the HTTP write-lock until
+        # the NEXT quorum's send_checkpoint(). For a fast model the next
+        # quorum starts in <1 ms — far shorter than the time a recovering
+        # replica needs to initiate the HTTP fetch — causing a 300-second
+        # deadlock. The checkpoint URL already encodes the step number, so
+        # the server rejects stale reads regardless; the lock is redundant
+        # for this benchmark where both replicas start from the same seed.
+        if MODE in _ASYNC_MODES:
+            transport.disallow_checkpoint = lambda: None  # type: ignore[method-assign]
 
         def load_state_dict(state_dict):
             m.load_state_dict(state_dict["model"])
             inner_optimizer.load_state_dict(state_dict["inner_optim"])
-            outer_optimizer.load_state_dict(state_dict["outer_optim"])
+            outer_opt = outer_optimizer_ref["optimizer"]
+            if outer_opt is not None and "outer_optim" in state_dict:
+                outer_opt.load_state_dict(state_dict["outer_optim"])
 
         def state_dict():
-            return {
+            payload = {
                 "model": m.state_dict(),
                 "inner_optim": inner_optimizer.state_dict(),
-                "outer_optim": outer_optimizer.state_dict(),
             }
+            outer_opt = outer_optimizer_ref["optimizer"]
+            if outer_opt is not None:
+                payload["outer_optim"] = outer_opt.state_dict()
+            return payload
 
         manager = Manager(
             pg=pg,
-            use_async_quorum=(MODE == "async_diloco"),
+            use_async_quorum=(MODE in _ASYNC_MODES),
             min_replica_size=1,
             load_state_dict=load_state_dict,
             state_dict=state_dict,
@@ -228,19 +275,40 @@ def main() -> None:
             checkpoint_transport=transport,
         )
 
-        context_cls = DiLoCo if MODE == "diloco" else AsyncDiLoCo
-        context_kwargs = dict(
-            manager=manager,
-            model_fragments=[m],
-            inner_optimizer=inner_optimizer,
-            outer_optimizer=outer_optimizer,
-            sync_every=SYNC_EVERY,
-            backup_device=device,
-            use_bucketization=True,
-        )
-        # Half-window overlap for DiLoCo: tuned for fast hardware, exposed by stragglers
         if MODE == "diloco":
-            context_kwargs["fragment_sync_delay"] = 0
+            context_cls = DiLoCo
+            context_kwargs = dict(
+                manager=manager,
+                model_fragments=[m],
+                inner_optimizer=inner_optimizer,
+                outer_optimizer=outer_optimizer,
+                sync_every=SYNC_EVERY,
+                backup_device=device,
+                use_bucketization=True,
+                fragment_sync_delay=0,
+            )
+        elif MODE == "async_diloco":
+            context_cls = AsyncDiLoCo
+            context_kwargs = dict(
+                manager=manager,
+                model_fragments=[m],
+                inner_optimizer=inner_optimizer,
+                outer_optimizer=outer_optimizer,
+                sync_every=SYNC_EVERY,
+                backup_device=device,
+                use_bucketization=True,
+            )
+        else:  # heloco
+            context_cls = HeLoCo
+            context_kwargs = dict(
+                manager=manager,
+                model_fragments=[m],
+                inner_optimizer=inner_optimizer,
+                outer_lr=_outer_lr,
+                sync_every=SYNC_EVERY,
+                backup_device=device,
+                use_bucketization=True,
+            )
 
         records = {
             "mode": MODE,
@@ -331,10 +399,12 @@ def main() -> None:
                 )
 
     if is_primary:
-        with context_cls(**context_kwargs):
+        with context_cls(**context_kwargs) as ctx:
+            if _uses_heloco_opt:
+                outer_optimizer_ref["optimizer"] = ctx._fragments[0]._outer_optimizer
             run_training()
         writer.flush()
-        out_path = f"output/benchmark/{MODE}/replica-{REPLICA_GROUP_ID}/metrics.json"
+        out_path = benchmark_outdir / MODE / f"replica-{REPLICA_GROUP_ID}" / "metrics.json"
         with open(out_path, "w") as f:
             json.dump(records, f, indent=2)
         print(f"[replica-{REPLICA_GROUP_ID}] metrics written to {out_path}")
@@ -346,5 +416,153 @@ def main() -> None:
         dist.destroy_process_group()
 
 
+# ── Plotting (used when invoked as: python3 benchmark_diloco.py --plot <files>) ──
+
+def _label(r: dict) -> str:
+    slow = r["slow_ms"]
+    mode = r["mode"].replace("_", " ").title()
+    return f"{mode} (slow={slow}ms)" if slow else mode
+
+
+def _boundary_steps(r: dict) -> list:
+    return [s for s in r["steps"] if s["is_boundary"]]
+
+
+def _plot_loss_vs_walltime(records: list, out: str) -> None:
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(9, 5))
+    for r in records:
+        wall = [s["wall_time_s"] for s in r["steps"]]
+        loss = [s["loss"] for s in r["steps"]]
+        ax.plot(wall, loss, label=_label(r), alpha=0.85)
+    ax.set_xlabel("Wall time (s)")
+    ax.set_ylabel("Cross-entropy loss")
+    ax.set_title("Loss vs Wall Time")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out, dpi=150)
+    plt.close(fig)
+    print(f"saved {out}")
+
+
+def _plot_loss_vs_step(records: list, out: str) -> None:
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(9, 5))
+    for r in records:
+        xs = [s["global_inner_step"] for s in r["steps"]]
+        ys = [s["loss"] for s in r["steps"]]
+        ax.plot(xs, ys, label=_label(r), alpha=0.85)
+    ax.set_xlabel("Inner step")
+    ax.set_ylabel("Cross-entropy loss")
+    ax.set_title("Loss vs Inner Step")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out, dpi=150)
+    plt.close(fig)
+    print(f"saved {out}")
+
+
+def _plot_outer_step_time(records: list, out: str) -> None:
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(9, 5))
+    for r in records:
+        xs = [o["outer_step"] for o in r["outer_steps"]]
+        ys = [o["outer_wall_ms"] for o in r["outer_steps"]]
+        ax.plot(xs, ys, label=_label(r), marker="o", markersize=3, alpha=0.85)
+    ax.set_xlabel("Outer step")
+    ax.set_ylabel("Duration (ms)")
+    ax.set_title("Outer Step Wall Time")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out, dpi=150)
+    plt.close(fig)
+    print(f"saved {out}")
+
+
+def _plot_boundary_step_ms(records: list, out: str) -> None:
+    import matplotlib.pyplot as plt
+    import numpy as np
+    fig, ax = plt.subplots(figsize=(9, 5))
+    for r in records:
+        durations = [s["step_ms"] for s in _boundary_steps(r)]
+        ax.hist(durations, bins=20, alpha=0.6, label=_label(r))
+    ax.set_xlabel("Last-step duration (ms)")
+    ax.set_ylabel("Count")
+    ax.set_title("Boundary Step Duration — DiLoCo blocks, AsyncDiLoCo overlaps")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out, dpi=150)
+    plt.close(fig)
+    print(f"saved {out}")
+
+
+def _write_summary(records: list, out: str) -> None:
+    import numpy as np
+
+    def _mean(values: list[float]) -> float:
+        return float(np.mean(values)) if values else float("nan")
+
+    def _p95(values: list[float]) -> float:
+        return float(np.percentile(values, 95)) if values else float("nan")
+
+    lines = []
+    for r in records:
+        steps = r["steps"]
+        outer = r["outer_steps"]
+        bsteps = _boundary_steps(r)
+        total_wall = outer[-1]["wall_time_s"] if outer else float("nan")
+        inner_ms = [s["step_ms"] for s in steps if not s["is_boundary"]]
+        boundary_ms = [s["step_ms"] for s in bsteps]
+        outer_ms = [o["outer_wall_ms"] for o in outer]
+        final_loss = steps[-1]["loss"] if steps else float("nan")
+        lines += [
+            f"=== {_label(r)} ===",
+            f"  Total wall time          : {total_wall:.1f}s",
+            f"  Final loss               : {final_loss:.4f}",
+            f"  Inner step (non-boundary): mean={_mean(inner_ms):.1f}ms  "
+            f"p95={_p95(inner_ms):.1f}ms",
+            f"  Boundary step            : mean={_mean(boundary_ms):.1f}ms  "
+            f"p95={_p95(boundary_ms):.1f}ms",
+            f"  Outer step               : mean={_mean(outer_ms):.1f}ms  "
+            f"p95={_p95(outer_ms):.1f}ms",
+            f"  Boundary overhead vs inner: "
+            f"{(_mean(boundary_ms) - _mean(inner_ms)) if inner_ms and boundary_ms else float('nan'):+.1f}ms/step",
+            "",
+        ]
+    text = "\n".join(lines)
+    Path(out).write_text(text)
+    print(text)
+    print(f"saved {out}")
+
+
+def plot_main() -> None:
+    """
+    Generate comparison plots from saved metrics files.
+
+    Usage:
+      python3 benchmark_diloco.py --plot <metrics1.json> [metrics2.json ...]
+    """
+    paths = sys.argv[2:]
+    if not paths:
+        print("usage: benchmark_diloco.py --plot <metrics1.json> [metrics2.json ...]")
+        sys.exit(1)
+    records = [json.load(open(p)) for p in paths]
+    out_base = Path(os.environ.get("BENCHMARK_OUTDIR", str(_BENCH_DIR / "output" / "benchmark")))
+    out_dir = out_base / "comparison"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    _plot_loss_vs_walltime(records, str(out_dir / "loss_vs_walltime.png"))
+    _plot_loss_vs_step(records, str(out_dir / "loss_vs_step.png"))
+    _plot_outer_step_time(records, str(out_dir / "outer_step_time.png"))
+    _plot_boundary_step_ms(records, str(out_dir / "boundary_step_ms.png"))
+    _write_summary(records, str(out_dir / "summary.txt"))
+
+
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "--plot":
+        plot_main()
+    else:
+        main()

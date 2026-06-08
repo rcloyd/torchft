@@ -13,7 +13,7 @@ from parameterized import parameterized
 from torch import nn, optim, Tensor
 from torch.distributed.distributed_c10d import Work
 from torch.distributed.tensor import DTensor
-from torchft.local_sgd import AsyncDiLoCo, DiLoCo, extract_local_tensor, LocalSGD
+from torchft.local_sgd import AsyncDiLoCo, DiLoCo, extract_local_tensor, HeLoCo, HeLoCoOptimizer, LocalSGD
 from torchft.manager import Manager
 from torchft.work import _DummyWork
 
@@ -651,4 +651,383 @@ class AsyncDiLoCoTest(TestCase):
                     atol=1e-6,
                     rtol=0,
                     msg=f"late-joiner pseudo-grad for {name!r} should be zero",
+                )
+
+
+class HeLoCoOptimizerTest(TestCase):
+    """Unit tests for HeLoCoOptimizer correction logic."""
+
+    def _make_opt(self, p: torch.Tensor, **kwargs) -> HeLoCoOptimizer:
+        defaults = dict(lr=0.1, momentum=0.9, cos_ok=0.2,
+                        k_dir=1.0, conf_c=0.0, k_shrink=0.5, beta_max=0.5, eps=1e-8)
+        defaults.update(kwargs)
+        return HeLoCoOptimizer([p], **defaults)
+
+    def test_first_step_no_correction(self) -> None:
+        """First step: momentum buffer is zero so no correction is applied."""
+        p = torch.tensor([1.0, 0.0])
+        opt = self._make_opt(p)
+        p.grad = torch.tensor([-1.0, 0.0])  # anti-aligned, but m=0 → no correction
+        p_before = p.data.clone()
+        opt.step()
+        # m was zero so no cosine correction; just the plain MLA first step
+        # m_new = 0 + 0.1 * delta = 0.1 * [-1, 0]
+        # p -= lr * (delta + mu * m_new) = 0.1*([-1,0] + 0.9*[-.1,0])
+        m_new = (1 - 0.9) * torch.tensor([-1.0, 0.0])
+        expected = p_before - 0.1 * (torch.tensor([-1.0, 0.0]) + 0.9 * m_new)
+        torch.testing.assert_close(p.data, expected)
+
+    def test_missing_grad_decays_existing_momentum(self) -> None:
+        """A tensor with no grad should still have its momentum decayed on a shared outer step."""
+        p_active = torch.tensor([0.0, 0.0])
+        p_stale = torch.tensor([0.0, 0.0])
+        opt = HeLoCoOptimizer(
+            [p_active, p_stale],
+            lr=0.1,
+            momentum=0.9,
+            cos_ok=0.2,
+            k_dir=1.0,
+            conf_c=0.0,
+            k_shrink=0.5,
+            beta_max=0.5,
+            eps=1e-8,
+        )
+        opt.state[p_active] = {"m": torch.tensor([0.0, 0.0])}
+        opt.state[p_stale] = {"m": torch.tensor([2.0, -4.0])}
+
+        p_active.grad = torch.tensor([1.0, 0.0])
+        p_before = p_stale.data.clone()
+        m_before = opt.state[p_stale]["m"].clone()
+
+        opt.step()
+
+        torch.testing.assert_close(opt.state[p_stale]["m"], 0.9 * m_before)
+        torch.testing.assert_close(p_stale.data, p_before)
+
+    def test_missing_grad_does_not_create_empty_state(self) -> None:
+        """A skipped tensor with no prior state should remain absent from optimizer state."""
+        p_active = torch.tensor([0.0, 0.0])
+        p_skipped = torch.tensor([0.0, 0.0])
+        opt = self._make_opt(p_active)
+        opt.param_groups[0]["params"].append(p_skipped)
+
+        p_active.grad = torch.tensor([1.0, 0.0])
+        p_skipped.grad = None
+
+        opt.step()
+
+        self.assertIn(p_active, opt.state)
+        self.assertNotIn(p_skipped, opt.state)
+
+    def test_aligned_no_correction(self) -> None:
+        """Gradient well-aligned with momentum (cos ≥ cos_ok): passes through unchanged."""
+        p = torch.tensor([0.0, 0.0])
+        opt = self._make_opt(p, cos_ok=0.2)
+        # Pre-seed momentum in the same direction as gradient
+        opt.state[p] = {"m": torch.tensor([1.0, 0.0])}
+        p.grad = torch.tensor([2.0, 0.0])  # cos = 1.0 ≥ 0.2
+        delta_before = p.grad.clone()
+        opt.step()
+        # delta should be unchanged; verify momentum updated with original delta
+        m_after = opt.state[p]["m"]
+        expected_m = 0.9 * torch.tensor([1.0, 0.0]) + 0.1 * delta_before
+        torch.testing.assert_close(m_after, expected_m, atol=1e-6, rtol=0)
+
+    def test_anti_aligned_shrinks_gradient(self) -> None:
+        """Anti-aligned gradient (cos < 0): anti-momentum projection is reduced."""
+        p = torch.tensor([0.0, 0.0])
+        opt = self._make_opt(p, cos_ok=0.2, k_shrink=0.5, beta_max=0.5, conf_c=0.0)
+        opt.state[p] = {"m": torch.tensor([1.0, 0.0])}
+        p.grad = torch.tensor([-1.0, 0.0])  # directly anti-aligned, cos = -1.0
+        p_before = p.data.clone()
+        opt.step()
+        # conf_c=0 → conf=1.0; cos=-1 → beta = clamp(0.5*1.0, max=0.5)*1.0 = 0.5
+        # paper formula: Δ̂ = Δ − β·cos·‖Δ‖·v̂ = [-1,0] - 0.5*(-1)*1*[1,0] = [-0.5, 0]
+        # verify the gradient was shrunk: p moved less than if delta was uncorrected
+        delta_uncorrected = torch.tensor([-1.0, 0.0])
+        self.assertLess(
+            (p.data - p_before).norm().item(),
+            (delta_uncorrected * 0.1).norm().item(),
+            "shrunk gradient should produce a smaller param update",
+        )
+
+    def test_moderate_misalignment_rotates_toward_momentum(self) -> None:
+        """Moderately misaligned (0 ≤ cos < cos_ok): gradient rotated toward momentum."""
+        p = torch.tensor([0.0, 0.0])
+        opt = self._make_opt(p, cos_ok=0.5, k_dir=1.0, conf_c=0.0)
+        # m along x-axis, delta along y-axis → cos = 0 (perpendicular, in rotate zone)
+        opt.state[p] = {"m": torch.tensor([1.0, 0.0])}
+        p.grad = torch.tensor([0.0, 1.0])
+        opt.step()
+        # After rotation, the update should have gained an x-component (toward m)
+        m_after = opt.state[p]["m"]
+        self.assertGreater(
+            m_after[0].item(), 0.0,
+            "rotation toward momentum should give m a positive x-component",
+        )
+
+    def test_shrink_conf_applied_after_clamp(self) -> None:
+        """conf scales beta AFTER the clamp, not before — catches the ordering bug."""
+        # With k_shrink=1.0, cos=-1.0, beta_max=0.3, conf_c=0:
+        #   raw = k_shrink * (-cos) = 1.0  →  clamp to 0.3  →  * conf=1.0  →  beta=0.3
+        #   (wrong order: clamp(1.0 * conf, max=0.3) gives same 0.3 when conf=1)
+        # With conf_c=10 and norm_m >> norm_d, conf becomes small:
+        #   conf = 1/(1+10*10) ≈ 0.01  (norm_d=1, norm_m=10)
+        #   correct: clamp(1.0, max=0.3) * 0.01 = 0.3 * 0.01 = 0.003
+        #   wrong:   clamp(1.0 * 0.01, max=0.3) = 0.01  (different!)
+        p = torch.tensor([0.0, 0.0])
+        opt = self._make_opt(p, cos_ok=0.2, k_shrink=1.0, beta_max=0.3,
+                             conf_c=10.0, eps=1e-8)
+        # Large momentum buffer → conf is small
+        opt.state[p] = {"m": torch.tensor([10.0, 0.0])}
+        p.grad = torch.tensor([-1.0, 0.0])  # anti-aligned, cos=-1
+        opt.step()
+        # norm_d=1, norm_m=10 → conf = 1/(1+10*10) = 1/101 ≈ 0.0099
+        # correct beta = clamp(1.0, 0, 0.3) * conf = 0.3 * 0.0099 ≈ 0.00297
+        # wrong beta   = clamp(1.0 * conf, 0, 0.3) = clamp(0.0099, 0, 0.3) = 0.0099
+        # The delta_corr magnitudes differ: (1-0.00297)≈0.997 vs (1-0.0099)≈0.990
+        # Recover delta_corr from updated momentum
+        m_after = opt.state[p]["m"]
+        m_old = torch.tensor([10.0, 0.0])
+        mu = 0.9
+        # m_after = mu * m_old + (1-mu) * delta_corr
+        delta_corr_recovered = (m_after - mu * m_old) / (1 - mu)
+        norm_corr = delta_corr_recovered.norm().item()
+        # Correct implementation: beta ≈ 0.003 → delta_corr ≈ -0.997
+        # Wrong implementation:   beta ≈ 0.010 → delta_corr ≈ -0.990
+        # The correct value is closer to 1.0
+        self.assertGreater(norm_corr, 0.995, "correct formula should shrink delta much less")
+        self.assertLess(norm_corr, 1.001, "cannot exceed original norm")
+
+    def test_rotation_lam_decreases_with_alignment(self) -> None:
+        """λ = k_d*(1−cos)*conf: less aligned → larger λ → more rotation toward momentum."""
+        # p1: delta perpendicular to m (cos=0) → λ=1.0*1.0*1.0=1.0 → full rotation
+        p1 = torch.tensor([0.0, 0.0])
+        opt1 = self._make_opt(p1, cos_ok=0.5, k_dir=1.0, conf_c=0.0)
+        opt1.state[p1] = {"m": torch.tensor([1.0, 0.0])}
+        p1.grad = torch.tensor([0.0, 1.0])  # cos=0, weakly aligned
+        opt1.step()
+        delta_corr1 = (opt1.state[p1]["m"] - 0.9 * torch.tensor([1.0, 0.0])) / 0.1
+
+        # p2: delta at cos≈0.4 with m (better aligned) → λ=1.0*0.6*1.0=0.6 → partial rotation
+        p2 = torch.tensor([0.0, 0.0])
+        opt2 = self._make_opt(p2, cos_ok=0.5, k_dir=1.0, conf_c=0.0)
+        opt2.state[p2] = {"m": torch.tensor([1.0, 0.0])}
+        p2.grad = torch.tensor([0.4, 0.9165])  # cos≈0.4, norm≈1, in rotate zone
+        opt2.step()
+        delta_corr2 = (opt2.state[p2]["m"] - 0.9 * torch.tensor([1.0, 0.0])) / 0.1
+
+        # Weakly aligned (cos=0) should gain more x-component (toward m) than cos=0.4
+        self.assertGreater(
+            delta_corr1[0].item(), delta_corr2[0].item(),
+            "cos=0 grad should rotate more toward m than cos=0.4 grad",
+        )
+
+    def test_magnitude_preserved_after_rotation(self) -> None:
+        """Rotation preserves the original pseudo-gradient magnitude."""
+        p = torch.tensor([0.0, 0.0])
+        opt = self._make_opt(p, cos_ok=0.5, k_dir=1.0, conf_c=0.0)
+        opt.state[p] = {"m": torch.tensor([1.0, 0.0])}
+        delta = torch.tensor([0.0, 2.0])  # perpendicular to m, ‖delta‖=2
+        p.grad = delta.clone()
+        # Record norm of delta before step; after correction norm should be same
+        norm_before = delta.norm().item()
+        p_before = p.data.clone()
+        opt.step()
+        # The correction is applied before the MLA update; we can't directly
+        # observe delta_corr, but the p update magnitude should reflect ‖delta‖=2
+        # (not more, not less from the rotation itself)
+        # Verify by checking that the update is in the rotated direction with same magnitude
+        m_after = opt.state[p]["m"]
+        # m_new = mu*m_old + (1-mu)*delta_corr; norm of delta_corr should equal norm_before
+        # ‖delta_corr‖ = norm_before → ‖m_new - mu*m_old‖ / (1-mu) ≈ norm_before
+        delta_corr_recovered = (m_after - 0.9 * torch.tensor([1.0, 0.0])) / 0.1
+        torch.testing.assert_close(
+            delta_corr_recovered.norm(), torch.tensor(norm_before), atol=1e-4, rtol=0,
+            msg="rotation must preserve pseudo-gradient magnitude",
+        )
+
+
+class HeLoCoTest(TestCase):
+    """Integration tests for the HeLoCo class."""
+
+    def test_heloco_requires_async_quorum(self) -> None:
+        """HeLoCo inherits the async_quorum requirement from AsyncDiLoCo."""
+        model = SimpleModel()
+        inner_optimizer = torch.optim.AdamW(model.parameters(), lr=4e-4)
+        manager = create_manager()
+        manager._use_async_quorum = False
+        with self.assertRaises(ValueError):
+            HeLoCo(manager, [model], inner_optimizer, sync_every=2)
+
+    def test_heloco_uses_heloco_optimizer(self) -> None:
+        """Each fragment's outer optimizer is a HeLoCoOptimizer instance."""
+        model = SimpleModel()
+        inner_optimizer = torch.optim.AdamW(model.parameters(), lr=4e-4)
+        manager = create_manager()
+        manager._use_async_quorum = True
+        heloco = HeLoCo(manager, [model], inner_optimizer, sync_every=2)
+        for fragment in heloco._fragments:
+            self.assertIsInstance(fragment._outer_optimizer, HeLoCoOptimizer)
+
+    def test_heloco_lookahead_uses_each_fragment_optimizer(self) -> None:
+        """Lookahead must use the matching outer optimizer for each fragment."""
+        model_a = SimpleModel()
+        model_b = SimpleModel()
+        inner_optimizer = torch.optim.AdamW(
+            list(model_a.parameters()) + list(model_b.parameters()), lr=4e-4
+        )
+        manager = create_manager()
+        manager._use_async_quorum = True
+
+        heloco = HeLoCo(manager, [model_a, model_b], inner_optimizer, sync_every=2)
+        fragment_a = heloco._fragments[0]
+        fragment_b = heloco._fragments[1]
+
+        fragment_b._outer_optimizer = HeLoCoOptimizer(
+            model_b.parameters(),
+            lr=0.3,
+            momentum=0.4,
+            cos_ok=0.2,
+            k_dir=1.0,
+            conf_c=0.0,
+            k_shrink=0.5,
+            beta_max=0.5,
+        )
+
+        lr_a = fragment_a._outer_optimizer.param_groups[0]["lr"]
+        mu_a = fragment_a._outer_optimizer.param_groups[0]["momentum"]
+        lr_b = fragment_b._outer_optimizer.param_groups[0]["lr"]
+        mu_b = fragment_b._outer_optimizer.param_groups[0]["momentum"]
+
+        for p in model_a.parameters():
+            fragment_a._outer_optimizer.state[p] = {"m": torch.full_like(p, 0.5)}
+        for p in model_b.parameters():
+            fragment_b._outer_optimizer.state[p] = {"m": torch.full_like(p, 1.5)}
+
+        params_a_before = {name: p.data.clone() for name, p in model_a.named_parameters()}
+        params_b_before = {name: p.data.clone() for name, p in model_b.named_parameters()}
+
+        heloco._apply_lookahead()
+
+        for name, p in model_a.named_parameters():
+            expected = params_a_before[name] - lr_a * mu_a * fragment_a._outer_optimizer.state[p]["m"]
+            torch.testing.assert_close(p.data, expected)
+
+        for name, p in model_b.named_parameters():
+            expected = params_b_before[name] - lr_b * mu_b * fragment_b._outer_optimizer.state[p]["m"]
+            torch.testing.assert_close(p.data, expected)
+
+    def test_heloco_first_window_does_not_apply_lookahead(self) -> None:
+        """First window should not apply lookahead or build outer state."""
+        model = SimpleModel()
+        inner_optimizer = torch.optim.AdamW(model.parameters(), lr=4e-4)
+        manager = create_manager()
+        manager._use_async_quorum = True
+        manager.current_step.return_value = 0
+
+        step_val = [0]
+        manager.current_step.side_effect = lambda: step_val[0]
+        manager.should_commit.side_effect = lambda: (step_val.__setitem__(0, step_val[0] + 1), True)[1]
+
+        with HeLoCo(
+            manager, [model], inner_optimizer, sync_every=2, use_lookahead=True
+        ) as heloco:
+            outer_opt = heloco._fragments[0]._outer_optimizer
+            for p in model.parameters():
+                outer_opt.state[p] = {"m": torch.full_like(p, 0.5)}
+
+            params_before = {name: p.data.clone() for name, p in model.named_parameters()}
+            momentum_before = {p: outer_opt.state[p]["m"].clone() for p in model.parameters()}
+            inp = torch.rand(2, 3)
+            for _ in range(2):
+                loss = model(inp).mean()
+                loss.backward()
+                inner_optimizer.step()
+
+            self.assertEqual(manager.start_quorum.call_count, 1)
+            self.assertEqual(manager.should_commit.call_count, 1)
+            self.assertTrue(heloco._allreduce_launched)
+            for p in model.parameters():
+                torch.testing.assert_close(outer_opt.state[p]["m"], momentum_before[p])
+
+            for name, p in model.named_parameters():
+                torch.testing.assert_close(
+                    p.data,
+                    params_before[name],
+                    msg=f"lookahead should not run on the first window for {name!r}",
+                )
+
+    def test_heloco_lookahead_fires_via_hook(self) -> None:
+        """_step_post_hook triggers look-ahead when a commit is detected."""
+        model = SimpleModel()
+        inner_optimizer = torch.optim.AdamW(model.parameters(), lr=4e-4)
+        manager = create_manager()
+        manager._use_async_quorum = True
+
+        # Simulate current_step incrementing on each should_commit() == True call,
+        # matching what the real manager does.
+        step_val = [0]
+        manager.current_step.side_effect = lambda: step_val[0]
+        manager.should_commit.side_effect = lambda: (step_val.__setitem__(0, step_val[0] + 1), True)[1]
+
+        with HeLoCo(
+            manager, [model], inner_optimizer, sync_every=2, use_lookahead=True
+        ) as heloco:
+            outer_opt = heloco._fragments[0]._outer_optimizer
+            inp = torch.rand(2, 3)
+
+            # Two full windows — the second window commits an outer step
+            for _ in range(4):
+                loss = model(inp).mean()
+                loss.backward()
+                inner_optimizer.step()
+
+            # Outer step was applied; optimizer should have momentum state
+            self.assertTrue(len(outer_opt.state) > 0, "outer step must have built optimizer state")
+
+            lr = outer_opt.param_groups[0]["lr"]
+            mu = outer_opt.param_groups[0]["momentum"]
+            fragment = heloco._fragments[0]
+
+            # With lookahead: p.data = original_parameters - lr*mu*m  ≠  original_parameters
+            any_shifted = False
+            for name, p in model.named_parameters():
+                state = outer_opt.state.get(p)
+                if state and "m" in state and state["m"].norm() > 1e-6:
+                    expected = fragment.original_parameters[name].to(p.device) - lr * mu * state["m"]
+                    torch.testing.assert_close(
+                        p.data, expected,
+                        msg=f"lookahead not applied via _step_post_hook for {name!r}",
+                    )
+                    any_shifted = True
+            self.assertTrue(any_shifted, "at least one parameter should have been shifted by lookahead")
+
+    def test_heloco_no_lookahead(self) -> None:
+        """With use_lookahead=False, _step_post_hook never shifts params after a commit."""
+        model = SimpleModel()
+        inner_optimizer = torch.optim.AdamW(model.parameters(), lr=4e-4)
+        manager = create_manager()
+        manager._use_async_quorum = True
+
+        step_val = [0]
+        manager.current_step.side_effect = lambda: step_val[0]
+        manager.should_commit.side_effect = lambda: (step_val.__setitem__(0, step_val[0] + 1), True)[1]
+
+        with HeLoCo(
+            manager, [model], inner_optimizer, sync_every=2, use_lookahead=False
+        ) as heloco:
+            inp = torch.rand(2, 3)
+            for _ in range(4):  # 2 full windows, including a commit
+                loss = model(inp).mean()
+                loss.backward()
+                inner_optimizer.step()
+
+            fragment = heloco._fragments[0]
+            # Without lookahead, local params must equal original_parameters (outer) exactly
+            for name, p in model.named_parameters():
+                torch.testing.assert_close(
+                    p.data,
+                    fragment.original_parameters[name].to(p.device),
+                    msg=f"{name!r}: params should equal outer with use_lookahead=False",
                 )

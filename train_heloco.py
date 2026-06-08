@@ -25,7 +25,7 @@ from torchft import (
     ProcessGroupNCCL,
 )
 from torchft.checkpointing.http_transport import HTTPTransport
-from torchft.local_sgd import AsyncDiLoCo
+from torchft.local_sgd import HeLoCo
 
 logging.basicConfig(level=logging.INFO)
 
@@ -40,17 +40,25 @@ def main() -> None:
 
     writer = SummaryWriter(f"{output_folder}/tensorboard", max_queue=1000)
 
+    # HeLoCo builds its outer optimizer (HeLoCoOptimizer) internally.
+    # We reference it via heloco.outer_optimizer after entering the context,
+    # using a mutable holder so the state_dict closures can see it.
+    outer_optimizer_holder: dict = {"opt": None}
+
     def load_state_dict(state_dict):
         m.load_state_dict(state_dict["model"])
         inner_optimizer.load_state_dict(state_dict["inner_optim"])
-        outer_optimizer.load_state_dict(state_dict["outer_optim"])
+        if outer_optimizer_holder["opt"] is not None and "outer_optim" in state_dict:
+            outer_optimizer_holder["opt"].load_state_dict(state_dict["outer_optim"])
 
     def state_dict():
-        return {
+        payload = {
             "model": m.state_dict(),
             "inner_optim": inner_optimizer.state_dict(),
-            "outer_optim": outer_optimizer.state_dict(),
         }
+        if outer_optimizer_holder["opt"] is not None:
+            payload["outer_optim"] = outer_optimizer_holder["opt"].state_dict()
+        return payload
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     pg = (
@@ -66,11 +74,11 @@ def main() -> None:
 
     manager = Manager(
         pg=pg,
-        use_async_quorum=True,  # required for AsyncDiLoCo
+        use_async_quorum=True,  # required for HeLoCo (extends AsyncDiLoCo)
         min_replica_size=1,
         load_state_dict=load_state_dict,
         state_dict=state_dict,
-        replica_id=f"train_asyncdiloco_{REPLICA_GROUP_ID}",
+        replica_id=f"train_heloco_{REPLICA_GROUP_ID}",
         timeout=timedelta(seconds=30),
         checkpoint_transport=transport,
     )
@@ -115,10 +123,7 @@ def main() -> None:
         m.parameters(), lr=4e-4, weight_decay=0.1, betas=(0.9, 0.95)
     )
     # Scale outer lr by 1/sqrt(K) so K async updates match one averaged update.
-    outer_lr = 0.7 / math.sqrt(NUM_REPLICA_GROUPS)
-    outer_optimizer: optim.Optimizer = torch.optim.SGD(
-        m.parameters(), lr=outer_lr, momentum=0.9, nesterov=True
-    )
+    outer_lr = float(os.environ.get("OUTER_LR", 0.7)) / math.sqrt(NUM_REPLICA_GROUPS)
 
     criterion = nn.CrossEntropyLoss()
 
@@ -140,16 +145,24 @@ def main() -> None:
 
     tensorboard_key_prefix = f"Run:{RUN}"
     prof.start()
-    with AsyncDiLoCo(
+    with HeLoCo(
         manager,
         [m],
         inner_optimizer,
-        outer_optimizer,
         sync_every=int(os.environ.get("SYNC_EVERY", 100)),
+        outer_lr=outer_lr,
+        outer_momentum=float(os.environ.get("OUTER_MOMENTUM", 0.9)),
+        cos_ok=float(os.environ.get("COS_OK", 0.2)),
+        k_dir=float(os.environ.get("K_DIR", 1.0)),
+        conf_c=float(os.environ.get("CONF_C", 3.0)),
+        k_shrink=float(os.environ.get("K_SHRINK", 0.5)),
+        beta_max=float(os.environ.get("BETA_MAX", 0.5)),
+        use_lookahead=os.getenv("USE_LOOKAHEAD", "True") == "True",
         backup_device=device,
         use_bucketization=True,
         bucket_cap_mb=25,
-    ):
+    ) as heloco:
+        outer_optimizer_holder["opt"] = heloco.outer_optimizer
         while True:
             for i, (inputs, labels) in enumerate(trainloader):
                 prof.step()
