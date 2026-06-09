@@ -865,5 +865,3 @@ class DiLoCo:
         assert False, (
             f"{self._local_step=} should never be greater than {self._sync_every=}"
         )
-
-

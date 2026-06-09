@@ -13,6 +13,7 @@ from parameterized import parameterized
 from torch import nn, optim, Tensor
 from torch.distributed.distributed_c10d import Work
 from torch.distributed.tensor import DTensor
+from torchft.local_sgd import DiLoCo, extract_local_tensor, LocalSGD
 from torchft.manager import Manager
 from torchft.work import _DummyWork
 
@@ -320,4 +321,3 @@ class DiLoCoTest(TestCase):
             t = torch.empty_like(param.grad)
             t.fill_(expected_grad)
             torch.testing.assert_close(param.grad, t)
-
