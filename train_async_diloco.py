@@ -6,7 +6,6 @@
 
 import csv
 import logging
-import math
 import os
 import random
 import time
@@ -21,8 +20,7 @@ from torch import nn, optim
 from torch.distributed.elastic.multiprocessing.errors import record
 from torch.utils.tensorboard import SummaryWriter
 
-from torchft.async_diloco import AsyncDiLoCo
-from torchft.heloco import HeLoCoOptimizer, HeLoCoServer
+from torchft.async_diloco import AsyncDiLoCo, AsyncDiLoCoServer, DelayedNesterovOptimizer
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -31,34 +29,17 @@ logger = logging.getLogger(__name__)
 @record
 def main() -> None:
     REPLICA_GROUP_ID = int(os.environ.get("REPLICA_GROUP_ID", 0))
-    OUTPUT_SUBDIR   = os.environ.get("OUTPUT_SUBDIR", "heloco")
-    SYNC_EVERY      = int(os.environ.get("SYNC_EVERY", 100))
-    N_LAYERS        = int(os.environ.get("N_LAYERS", 4))
-    D_HID           = int(os.environ.get("D_HID", 128))
-    BATCH_SIZE      = int(os.environ.get("BATCH_SIZE", 256))
-    MAX_STEPS       = int(os.environ.get("MAX_STEPS", 500))
-    DYLU_H          = int(os.environ.get("DYLU_H", 0))
-    WORKER_DELAY_MS          = float(os.environ.get("WORKER_DELAY_MS", 0))
-    WORKER_DELAY_RANDOM_MIN  = float(os.environ.get("WORKER_DELAY_RANDOM_MIN", -1))
-    WORKER_DELAY_RANDOM_MAX  = float(os.environ.get("WORKER_DELAY_RANDOM_MAX", -1))
+    OUTPUT_SUBDIR = os.environ.get("OUTPUT_SUBDIR", "async")
+    SYNC_EVERY = int(os.environ.get("SYNC_EVERY", 100))
+    N_LAYERS = int(os.environ.get("N_LAYERS", 4))
+    D_HID = int(os.environ.get("D_HID", 128))
+    BATCH_SIZE = int(os.environ.get("BATCH_SIZE", 256))
+    MAX_STEPS = int(os.environ.get("MAX_STEPS", 500))
+    DN_PERIOD = int(os.environ.get("DN_PERIOD", 4))
+    WORKER_DELAY_MS = float(os.environ.get("WORKER_DELAY_MS", 0))
+    WORKER_DELAY_RANDOM_MIN = float(os.environ.get("WORKER_DELAY_RANDOM_MIN", -1))
+    WORKER_DELAY_RANDOM_MAX = float(os.environ.get("WORKER_DELAY_RANDOM_MAX", -1))
     use_random_delay = WORKER_DELAY_RANDOM_MIN >= 0 and WORKER_DELAY_RANDOM_MAX >= 0
-
-    # HeLoCo outer optimizer hyperparameters (Eqs. 18-19, Algorithm 2)
-    OUTER_LR       = float(os.environ.get("OUTER_LR", 0.7))
-    OUTER_MOMENTUM = float(os.environ.get("OUTER_MOMENTUM", 0.9))
-
-    # rho: arrival weight applied after block correction.
-    # The paper recommends rho = 1/sqrt(K) for K concurrent workers.
-    # Set NUM_WORKERS to enable automatic scaling; otherwise RHO is used as-is.
-    NUM_WORKERS = int(os.environ.get("NUM_WORKERS", 1))
-    RHO = float(os.environ.get("RHO", 1.0 / math.sqrt(max(NUM_WORKERS, 1))))
-
-    # Block-correction hyperparameters (Algorithm 2)
-    C_OK     = float(os.environ.get("C_OK", 0.2))
-    K_S      = float(os.environ.get("K_S", 0.5))
-    K_D      = float(os.environ.get("K_D", 1.0))
-    KAPPA    = float(os.environ.get("KAPPA", 3.0))
-    BETA_MAX = float(os.environ.get("BETA_MAX", 0.5))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -88,38 +69,19 @@ def main() -> None:
             return self.net(x)
 
     # Server setup: start inline if no address provided, otherwise connect to existing.
-    server_addr = os.environ.get("HELOCO_SERVER_ADDR", "")
-    hb_addr = os.environ.get("HELOCO_HEARTBEAT_ADDR", "")
+    server_addr = os.environ.get("ASYNC_DILOCO_SERVER_ADDR", "")
     server = None
     if not server_addr:
         global_model = MLPModule(D_HID, N_LAYERS)
-        outer_optimizer: optim.Optimizer = HeLoCoOptimizer(
-            global_model.parameters(),
-            lr=OUTER_LR,
-            momentum=OUTER_MOMENTUM,
+        outer_optimizer: optim.Optimizer = DelayedNesterovOptimizer(
+            global_model.parameters(), lr=0.7, momentum=0.9, nesterov_period=DN_PERIOD,
         )
-        server = HeLoCoServer(
-            global_model,
-            outer_optimizer,
-            port=0,
-            dylu_H=DYLU_H,
-            rho=RHO,
-            c_ok=C_OK,
-            k_s=K_S,
-            k_d=K_D,
-            kappa=KAPPA,
-            beta_max=BETA_MAX,
-        )
+        server = AsyncDiLoCoServer(global_model, outer_optimizer, port=0)
         server_addr = server.address()
-        hb_addr = server.heartbeat_address()
-        logger.info(f"HeLoCoServer started at {server_addr} (heartbeat: {hb_addr})")
+        logger.info(f"AsyncDiLoCoServer started at {server_addr}")
 
     if os.environ.get("SERVER_ONLY", "0") == "1":
-        logger.info(
-            "SERVER_ONLY=1: set HELOCO_SERVER_ADDR=%s HELOCO_HEARTBEAT_ADDR=%s in workers",
-            server_addr,
-            hb_addr,
-        )
+        logger.info("SERVER_ONLY=1: set ASYNC_DILOCO_SERVER_ADDR=%s in workers", server_addr)
         while True:
             time.sleep(3600)
 
@@ -144,17 +106,19 @@ def main() -> None:
     csv_path = f"{output_folder}/metrics.csv"
     csv_file = open(csv_path, "w", newline="")
     csv_writer = csv.writer(csv_file)
-    csv_writer.writerow(["step", "loss", "step_duration_ms", "is_sync", "active_workers", "wall_time"])
+    csv_writer.writerow(["step", "loss", "step_duration_ms", "is_sync", "wall_time"])
 
     num_params = sum(p.numel() for p in m.parameters())
     if use_random_delay:
         delay_desc = f"random {WORKER_DELAY_RANDOM_MIN:.0f}–{WORKER_DELAY_RANDOM_MAX:.0f} ms/step"
     else:
         delay_desc = f"{WORKER_DELAY_MS:.0f} ms/step"
-    logger.info(
-        f"Worker {REPLICA_GROUP_ID}: {num_params:,} params, rho={RHO:.3f}, delay={delay_desc}"
-    )
+    logger.info(f"Worker {REPLICA_GROUP_ID}: {num_params:,} params, delay={delay_desc}")
 
+    # Barrier: wait for all benchmark workers to reach this point before any
+    # worker enters the AsyncDiLoCo context and calls _initial_pull.  Without
+    # this, fast-starting workers can do several outer syncs before slow-starting
+    # workers connect, causing them to receive a partially-trained server model.
     BARRIER_DIR     = os.environ.get("BARRIER_DIR", "")
     BARRIER_WORKERS = int(os.environ.get("BARRIER_WORKERS", "0"))
     if BARRIER_DIR and BARRIER_WORKERS > 0:
@@ -177,7 +141,6 @@ def main() -> None:
         model=m,
         inner_optimizer=inner_optimizer,
         sync_every=SYNC_EVERY,
-        heartbeat_address=hb_addr or None,
     ):
         while step < MAX_STEPS:
             for inputs, labels in trainloader:
@@ -208,21 +171,16 @@ def main() -> None:
                 wall_time = time.perf_counter() - run_start
                 loss_val = loss.item()
 
-                active = server.worker_count() if server is not None else -1
-
                 writer.add_scalar("loss", loss_val, step)
                 writer.add_scalar("step_duration_ms", step_ms, step)
-                if active >= 0:
-                    writer.add_scalar("active_workers", active, step)
                 csv_writer.writerow(
-                    [step, f"{loss_val:.6f}", f"{step_ms:.2f}", int(is_sync), active, f"{wall_time:.3f}"]
+                    [step, f"{loss_val:.6f}", f"{step_ms:.2f}", int(is_sync), f"{wall_time:.3f}"]
                 )
 
                 if step % 100 == 0:
                     logger.info(
                         f"[worker {REPLICA_GROUP_ID}] step={step} "
-                        f"loss={loss_val:.4f} step_ms={step_ms:.1f} "
-                        f"active_workers={active}"
+                        f"loss={loss_val:.4f} step_ms={step_ms:.1f}"
                     )
                 step += 1
 

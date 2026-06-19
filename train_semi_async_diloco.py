@@ -25,7 +25,7 @@ from torchft import (
     ProcessGroupNCCL,
 )
 from torchft.checkpointing.http_transport import HTTPTransport
-from torchft.local_sgd import AsyncDiLoCo
+from torchft.semi_async_diloco import SemiAsyncDiLoCo
 
 logging.basicConfig(level=logging.INFO)
 
@@ -66,7 +66,7 @@ def main() -> None:
 
     manager = Manager(
         pg=pg,
-        use_async_quorum=True,  # required for AsyncDiLoCo
+        use_async_quorum=True,  # required for SemiAsyncDiLoCo
         min_replica_size=1,
         load_state_dict=load_state_dict,
         state_dict=state_dict,
@@ -140,7 +140,7 @@ def main() -> None:
 
     tensorboard_key_prefix = f"Run:{RUN}"
     prof.start()
-    with AsyncDiLoCo(
+    with SemiAsyncDiLoCo(
         manager,
         [m],
         inner_optimizer,
