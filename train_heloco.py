@@ -4,25 +4,18 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import csv
 import logging
-import math
 import os
-import random
-import time
 
 REPLICA_GROUP_ID = int(os.environ.get("REPLICA_GROUP_ID", 0))
-os.environ["CUDA_VISIBLE_DEVICES"] = os.environ.get(
-    "CUDA_VISIBLE_DEVICES", str(REPLICA_GROUP_ID % 4)
-)
+os.environ["CUDA_VISIBLE_DEVICES"] = str(REPLICA_GROUP_ID % 4)
 
 import torch
 from torch import nn, optim
 from torch.distributed.elastic.multiprocessing.errors import record
 from torch.utils.tensorboard import SummaryWriter
 
-from torchft.async_diloco import AsyncDiLoCo
-from torchft.heloco import HeLoCoOptimizer, HeLoCoServer
+from torchft.heloco import HeLoCoOptimizer, HeLoCoServer, HeLoCoWorker
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -31,84 +24,41 @@ logger = logging.getLogger(__name__)
 @record
 def main() -> None:
     REPLICA_GROUP_ID = int(os.environ.get("REPLICA_GROUP_ID", 0))
-    OUTPUT_SUBDIR   = os.environ.get("OUTPUT_SUBDIR", "heloco")
-    SYNC_EVERY      = int(os.environ.get("SYNC_EVERY", 100))
-    N_LAYERS        = int(os.environ.get("N_LAYERS", 4))
-    D_HID           = int(os.environ.get("D_HID", 128))
-    BATCH_SIZE      = int(os.environ.get("BATCH_SIZE", 256))
-    MAX_STEPS       = int(os.environ.get("MAX_STEPS", 500))
-    DYLU_H          = int(os.environ.get("DYLU_H", 0))
-    WORKER_DELAY_MS          = float(os.environ.get("WORKER_DELAY_MS", 0))
-    WORKER_DELAY_RANDOM_MIN  = float(os.environ.get("WORKER_DELAY_RANDOM_MIN", -1))
-    WORKER_DELAY_RANDOM_MAX  = float(os.environ.get("WORKER_DELAY_RANDOM_MAX", -1))
-    use_random_delay = WORKER_DELAY_RANDOM_MIN >= 0 and WORKER_DELAY_RANDOM_MAX >= 0
-
-    # HeLoCo outer optimizer hyperparameters (Eqs. 18-19, Algorithm 2)
-    OUTER_LR       = float(os.environ.get("OUTER_LR", 0.7))
-    OUTER_MOMENTUM = float(os.environ.get("OUTER_MOMENTUM", 0.9))
-
-    # rho: arrival weight applied after block correction.
-    # The paper recommends rho = 1/sqrt(K) for K concurrent workers.
-    # Set NUM_WORKERS to enable automatic scaling; otherwise RHO is used as-is.
-    NUM_WORKERS = int(os.environ.get("NUM_WORKERS", 1))
-    RHO = float(os.environ.get("RHO", 1.0 / math.sqrt(max(NUM_WORKERS, 1))))
-
-    # Block-correction hyperparameters (Algorithm 2)
-    C_OK     = float(os.environ.get("C_OK", 0.2))
-    K_S      = float(os.environ.get("K_S", 0.5))
-    K_D      = float(os.environ.get("K_D", 1.0))
-    KAPPA    = float(os.environ.get("KAPPA", 3.0))
-    BETA_MAX = float(os.environ.get("BETA_MAX", 0.5))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    class DummyDataset(torch.utils.data.Dataset):
-        def __init__(self, size: int = 100000, feature_dim: int = 128, num_classes: int = 10):
-            self.size = size
-            self.feature_dim = feature_dim
-            self.num_classes = num_classes
-
-        def __len__(self) -> int:
-            return self.size
-
-        def __getitem__(self, idx: int):
-            features = torch.rand(self.feature_dim)
-            label = torch.randint(0, self.num_classes, (1,)).item()
-            return features, label
+    d_hid = 128
+    n_layers = 2
+    num_workers = 4
 
     class MLPModule(nn.Module):
-        def __init__(self, d_hid: int, n_layers: int):
+        def __init__(self):
             super().__init__()
-            layers = []
-            for _ in range(n_layers):
-                layers += [nn.Linear(d_hid, d_hid), nn.ReLU()]
+            layers = [nn.Linear(d_hid, d_hid), nn.ReLU()] * n_layers
             self.net = nn.Sequential(*layers)
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
             return self.net(x)
 
-    # Server setup: start inline if no address provided, otherwise connect to existing.
+    class DummyDataset(torch.utils.data.Dataset):
+        def __len__(self) -> int:
+            return 10000
+
+        def __getitem__(self, _):
+            return torch.rand(d_hid), int(torch.randint(0, 10, (1,)))
+
     server_addr = os.environ.get("HELOCO_SERVER_ADDR", "")
     hb_addr = os.environ.get("HELOCO_HEARTBEAT_ADDR", "")
     server = None
     if not server_addr:
-        global_model = MLPModule(D_HID, N_LAYERS)
+        global_model = MLPModule()
         outer_optimizer: optim.Optimizer = HeLoCoOptimizer(
-            global_model.parameters(),
-            lr=OUTER_LR,
-            momentum=OUTER_MOMENTUM,
+            global_model.parameters(), lr=0.7, momentum=0.9,
         )
         server = HeLoCoServer(
-            global_model,
-            outer_optimizer,
-            port=0,
-            dylu_H=DYLU_H,
-            rho=RHO,
-            c_ok=C_OK,
-            k_s=K_S,
-            k_d=K_D,
-            kappa=KAPPA,
-            beta_max=BETA_MAX,
+            global_model, outer_optimizer, port=0,
+            rho=1.0 / (num_workers ** 0.5),
+            dylu_H=20, grace_period=0.5,
         )
         server_addr = server.address()
         hb_addr = server.heartbeat_address()
@@ -117,13 +67,13 @@ def main() -> None:
     if os.environ.get("SERVER_ONLY", "0") == "1":
         logger.info(
             "SERVER_ONLY=1: set HELOCO_SERVER_ADDR=%s HELOCO_HEARTBEAT_ADDR=%s in workers",
-            server_addr,
-            hb_addr,
+            server_addr, hb_addr,
         )
+        import time
         while True:
             time.sleep(3600)
 
-    m = MLPModule(D_HID, N_LAYERS).to(device)
+    m = MLPModule().to(device)
     if server is not None:
         m.load_state_dict(server._model.state_dict())
 
@@ -132,58 +82,27 @@ def main() -> None:
     )
     criterion = nn.CrossEntropyLoss()
 
-    trainset = DummyDataset(size=100000, feature_dim=D_HID)
     trainloader = torch.utils.data.DataLoader(
-        trainset, batch_size=BATCH_SIZE, num_workers=2, shuffle=True
+        DummyDataset(), batch_size=64, num_workers=2, shuffle=True
     )
 
-    output_folder = f"output/{OUTPUT_SUBDIR}/replica-{REPLICA_GROUP_ID}"
+    output_folder = f"output/replica-{REPLICA_GROUP_ID}"
     os.makedirs(output_folder, exist_ok=True)
     writer = SummaryWriter(f"{output_folder}/tensorboard", max_queue=1000)
 
-    csv_path = f"{output_folder}/metrics.csv"
-    csv_file = open(csv_path, "w", newline="")
-    csv_writer = csv.writer(csv_file)
-    csv_writer.writerow(["step", "loss", "step_duration_ms", "is_sync", "active_workers", "wall_time"])
-
     num_params = sum(p.numel() for p in m.parameters())
-    if use_random_delay:
-        delay_desc = f"random {WORKER_DELAY_RANDOM_MIN:.0f}–{WORKER_DELAY_RANDOM_MAX:.0f} ms/step"
-    else:
-        delay_desc = f"{WORKER_DELAY_MS:.0f} ms/step"
-    logger.info(
-        f"Worker {REPLICA_GROUP_ID}: {num_params:,} params, rho={RHO:.3f}, delay={delay_desc}"
-    )
+    logger.info(f"Worker {REPLICA_GROUP_ID}: {num_params:,} params")
 
-    BARRIER_DIR     = os.environ.get("BARRIER_DIR", "")
-    BARRIER_WORKERS = int(os.environ.get("BARRIER_WORKERS", "0"))
-    if BARRIER_DIR and BARRIER_WORKERS > 0:
-        os.makedirs(BARRIER_DIR, exist_ok=True)
-        open(os.path.join(BARRIER_DIR, f"ready_{REPLICA_GROUP_ID}"), "w").close()
-        deadline = time.perf_counter() + 60
-        while time.perf_counter() < deadline:
-            if all(
-                os.path.exists(os.path.join(BARRIER_DIR, f"ready_{i}"))
-                for i in range(BARRIER_WORKERS)
-            ):
-                break
-            time.sleep(0.05)
-
-    run_start = time.perf_counter()
-    step = 0
-
-    with AsyncDiLoCo(
+    with HeLoCoWorker(
         server_address=server_addr,
         model=m,
         inner_optimizer=inner_optimizer,
-        sync_every=SYNC_EVERY,
+        sync_every=20,
         heartbeat_address=hb_addr or None,
     ):
-        while step < MAX_STEPS:
+        step = 0
+        while True:
             for inputs, labels in trainloader:
-                if step >= MAX_STEPS:
-                    break
-
                 inputs = inputs.to(device)
                 labels = labels.to(device)
 
@@ -191,44 +110,17 @@ def main() -> None:
                 out = m(inputs)
                 loss = criterion(out, labels)
                 loss.backward()
-
-                is_sync = ((step + 1) % SYNC_EVERY == 0)
-
-                if use_random_delay:
-                    delay_ms = random.uniform(WORKER_DELAY_RANDOM_MIN, WORKER_DELAY_RANDOM_MAX)
-                else:
-                    delay_ms = WORKER_DELAY_MS
-
-                t0 = time.perf_counter()
                 inner_optimizer.step()
-                if delay_ms > 0:
-                    time.sleep(delay_ms / 1000.0)
-                step_ms = (time.perf_counter() - t0) * 1000.0
 
-                wall_time = time.perf_counter() - run_start
-                loss_val = loss.item()
-
-                active = server.worker_count() if server is not None else -1
-
-                writer.add_scalar("loss", loss_val, step)
-                writer.add_scalar("step_duration_ms", step_ms, step)
-                if active >= 0:
-                    writer.add_scalar("active_workers", active, step)
-                csv_writer.writerow(
-                    [step, f"{loss_val:.6f}", f"{step_ms:.2f}", int(is_sync), active, f"{wall_time:.3f}"]
-                )
+                writer.add_scalar("loss", loss.item(), step)
 
                 if step % 100 == 0:
-                    logger.info(
-                        f"[worker {REPLICA_GROUP_ID}] step={step} "
-                        f"loss={loss_val:.4f} step_ms={step_ms:.1f} "
-                        f"active_workers={active}"
-                    )
-                step += 1
+                    logger.info(f"[worker {REPLICA_GROUP_ID}] step={step} loss={loss.item():.4f}")
 
-    csv_file.close()
-    writer.flush()
-    logger.info(f"Worker {REPLICA_GROUP_ID} finished after {step} steps.")
+                step += 1
+                if step >= 1000:
+                    writer.flush()
+                    return
 
 
 if __name__ == "__main__":
