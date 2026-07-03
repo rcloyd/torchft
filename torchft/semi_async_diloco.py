@@ -295,6 +295,9 @@ class SemiAsyncDiLoCo:
     def _step_post_hook(
         self, _optim: optim.Optimizer, _args: Tuple[Any, ...], _kwargs: Dict[str, Any]
     ) -> bool:
+        # torch ignores post-hook return values; the bool is for
+        # SemiAsyncHeLoCo._step_post_hook, which calls this via super() and
+        # applies its lookahead shift only when an outer step was committed.
         self._manager.allow_state_dict_read()
 
         self._local_step += 1

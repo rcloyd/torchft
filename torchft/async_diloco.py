@@ -14,13 +14,16 @@ Reference: https://arxiv.org/pdf/2401.09135
 """
 
 import dataclasses
-import itertools
 import json
 import logging
+import math
+import os
 import socket
 import threading
 import time
 import urllib.request
+import uuid
+from datetime import timedelta
 from http.server import BaseHTTPRequestHandler
 from types import TracebackType
 from typing import Any, Dict, List, Optional, Tuple, Type
@@ -35,8 +38,6 @@ from torchft.parameter_server import ParameterServer
 from torchft.process_group import ProcessGroup, ProcessGroupGloo
 
 logger: logging.Logger = logging.getLogger(__name__)
-
-_worker_counter = itertools.count()
 
 
 class DelayedNesterovOptimizer(optim.Optimizer):
@@ -138,19 +139,23 @@ class _GraceBatch:
     Created by the first worker to arrive. Subsequent workers that arrive
     before ``deadline`` append their pseudo-gradients to ``grads_list``.
     The first thread whose ``deadline`` has passed becomes the *processor*:
-    it applies each worker's update sequentially (matching paper Algorithm 2:
-    θ ← sync(θ, w.update) for each w in arrival order), fills ``snapshot``
-    and ``pool_max_speed``, then calls ``notify_all`` so every other thread
-    in the batch can continue.
+    at claim time the batch is detached from the server (late arrivals open
+    a fresh batch), so the processor can safely iterate ``grads_list``. It
+    applies each worker's update sequentially (matching paper Algorithm 2:
+    θ ← sync(θ, w.update) for each w in arrival order), fills ``snapshot_flat``
+    / ``revision`` / ``pool_speed``, then publishes so every other thread in
+    the batch can continue. If processing fails, ``error`` is published
+    instead so waiters fail fast rather than hanging.
     """
     grads_list: List[Dict[str, torch.Tensor]]  # per-worker pseudo_grads, arrival order
     speeds: List[float]                         # per-worker speeds (for DyLU pool)
     deadline: float                             # time.monotonic() deadline
-    count: int = 0                              # workers accumulated so far
     claimed: bool = False                       # processor has been elected
-    done: bool = False                          # results are ready
-    snapshot: Optional[Dict[str, torch.Tensor]] = None
-    pool_max_speed: float = 0.0                 # max speed in pool after step
+    done: bool = False                          # results (or error) are ready
+    error: Optional[str] = None                 # set if the processor failed
+    snapshot_flat: Optional[torch.Tensor] = None
+    revision: int = 0                           # global-model revision of snapshot
+    pool_speed: float = 0.0                     # DyLU pool speed after step
 
 
 class AsyncDiLoCoServer(ParameterServer):
@@ -166,7 +171,29 @@ class AsyncDiLoCoServer(ParameterServer):
     Thread-safe: concurrent worker sessions serialize around the optimizer step.
     The model passed here acts as the global (outer) model and should be on CPU.
     The outer_optimizer must reference this model's parameters.
+
+    Every committed outer step increments the server's global-model
+    *revision*. Workers track the revision their pseudo-gradient is relative
+    to; a push whose baseline revision is ahead of the server's (possible only
+    after the server restored from an older checkpoint) is rejected and the
+    worker resyncs instead of silently corrupting the outer trajectory.
+
+    Deployment assumptions (inherited from the ParameterServer prototype):
+      - **Reachability**: the session data plane (Gloo) forms point-to-point
+        pairs and picks the connect direction by address comparison, so the
+        server and workers must be *bidirectionally* dialable — workers
+        behind NAT or asymmetric routing will hang during pair formation.
+        Addresses are derived from ``socket.gethostname()``, so all hosts
+        must resolve each other's hostnames.
+      - **Security**: the HTTP endpoints and the Gloo/TCPStore tensor plane
+        are unauthenticated plaintext. Run on a trusted, isolated network
+        (VPC / WireGuard or similar); anyone who can reach the ports can
+        read or poison the model.
     """
+
+    # Explicit Gloo timeout for session process groups: a dead peer parks a
+    # server thread for at most this long instead of the wrapper default.
+    SESSION_TIMEOUT_SECONDS: float = 60.0
 
     def __init__(
         self,
@@ -174,11 +201,15 @@ class AsyncDiLoCoServer(ParameterServer):
         outer_optimizer: optim.Optimizer,
         port: int = 0,
         store_port: int = 0,
+        monitor_port: int = 0,
         dylu_H: int = 0,
         dylu_timeout: float = 300.0,
+        dylu_percentile: float = 0.9,
         heartbeat_timeout: float = 15.0,
         should_quantize: bool = False,
         grace_period: float = 0.0,
+        checkpoint_path: Optional[str] = None,
+        checkpoint_every: int = 10,
     ) -> None:
         """
         Args:
@@ -187,87 +218,139 @@ class AsyncDiLoCoServer(ParameterServer):
             outer_optimizer: Outer optimizer bound to ``model.parameters()``.
             port: HTTP port for the session endpoint (0 = OS-assigned).
             store_port: TCPStore port (0 = OS-assigned).
+            monitor_port: HTTP port for the heartbeat/status endpoints
+                (0 = OS-assigned). Set explicitly so the port can be
+                pre-opened in firewalls / security groups and advertised
+                statically.
             dylu_H: Maximum local steps H for Dynamic Local Updates (DyLU).
                 Per the paper (Eq. 6), each worker w is assigned
-                ``floor(v(w) / max_{w'∈W} v(w') * H)`` steps so slower
+                ``floor(v(w) / v_ref * H)`` steps (capped at H) so slower
                 workers finish each window in roughly the same wall-clock
-                time as the fastest worker.
+                time as the fastest workers, where ``v_ref`` is a high
+                percentile of the recent speed pool (see ``dylu_percentile``).
                 Set to 0 (default) to disable DyLU; workers keep their own
                 ``sync_every`` unchanged.
             dylu_timeout: Seconds after which a worker that has not synced
                 is removed from the active set W. Defaults to 300 s.
+            dylu_percentile: Percentile of the speed pool used as the DyLU
+                reference speed. Using a high percentile instead of the max
+                keeps a single mis-measured outlier window from shrinking
+                every worker's window until ``dylu_timeout`` expires it.
+                Defaults to 0.9.
             heartbeat_timeout: Seconds without a heartbeat before a worker
                 is considered departed and removed from the active set.
                 Workers send heartbeats every ``heartbeat_interval`` seconds
                 (configured on the worker side; default 2 s). Defaults to 15 s.
-            should_quantize: If True, send/receive parameter tensors as float16
-                over the wire and cast back to float32 on each side. Halves Gloo
-                transfer bandwidth at the cost of ~1e-3 precision loss per
-                sync. Must match the worker's ``should_quantize`` setting.
+            should_quantize: If True, receive worker pseudo-gradients as
+                float16 over the wire (halving upload bandwidth). The
+                server→worker parameter download always stays float32:
+                quantizing the authoritative params would compound error
+                into every worker's baseline each sync. Must match the
+                worker's ``should_quantize`` setting.
             grace_period: Seconds the server waits after the first worker
                 delivers pseudo-gradients before applying the outer step.
                 Workers arriving within the window have their gradients
                 averaged into a single outer step (§3.3 of the paper).
                 0.0 (default) disables grace-period aggregation.
+            checkpoint_path: File path for periodic server-state checkpoints
+                (global model, outer optimizer state, revision). If the file
+                exists at construction time, state is restored from it.
+                None (default) disables checkpointing.
+            checkpoint_every: Outer steps between checkpoints when
+                ``checkpoint_path`` is set. Defaults to 10.
         """
         self._lock = threading.Lock()
         self._model = model
         self._outer_optimizer = outer_optimizer
-        self._param_names: List[str] = [n for n, _ in model.named_parameters()]
+        self._param_names: List[str] = []
+        self._param_shapes: List[torch.Size] = []
+        self._param_numels: List[int] = []
+        for name, p in model.named_parameters():
+            self._param_names.append(name)
+            self._param_shapes.append(p.shape)
+            self._param_numels.append(p.numel())
+        self._total_numel: int = sum(self._param_numels)
+
         self._quantize: bool = should_quantize
         self._grace_period: float = grace_period
         self._grace_batch: Optional[_GraceBatch] = None
         self._grace_cond: threading.Condition = threading.Condition()
         self._dylu_H: int = dylu_H
         self._dylu_timeout: float = dylu_timeout
+        self._dylu_percentile: float = dylu_percentile
         # DyLU speed pool: list of (v(w), timestamp) from all recent sessions.
-        # Per-worker identity not needed — max across the pool is sufficient.
+        # Per-worker identity not needed — a pool percentile is sufficient.
         self._worker_speeds: List[Tuple[float, float]] = []
         # Heartbeat registry: worker_id → last_seen monotonic timestamp
         self._heartbeats: Dict[str, float] = {}
         self._heartbeat_timeout: float = heartbeat_timeout
 
-        # Standalone HTTP server just for heartbeats — separate port, no changes
-        # to ParameterServer needed.  Handler uses a closure over `self`.
+        # Global-model revision: incremented on every committed outer step.
+        self._revision: int = 0
+        self._applied_pushes: int = 0
+        self._last_step_time: Optional[float] = None  # wall clock, for /status
+        # One snapshot shared by all sessions at the same revision
+        # (K concurrent syncs no longer cost K model-size clones).
+        self._snapshot_cache: Optional[Tuple[int, torch.Tensor]] = None
+
+        self._checkpoint_path: Optional[str] = checkpoint_path
+        self._checkpoint_every: int = checkpoint_every
+        self._last_checkpoint_revision: int = 0
+        if checkpoint_path is not None and os.path.exists(checkpoint_path):
+            self._load_checkpoint(checkpoint_path)
+
+        self._shutdown_event = threading.Event()
+
+        # Standalone HTTP server for heartbeats and the status endpoint —
+        # separate port, no changes to the shared ParameterServer prototype
+        # needed. Handler uses a closure over `self`.
         server_ref = self
 
-        class _HeartbeatHandler(BaseHTTPRequestHandler):
+        class _MonitoringHandler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:
                 parsed = urlparse(self.path)
-                qs = parse_qs(parsed.query)
-                wids = qs.get("worker_id", [])
-                if parsed.path != "/heartbeat" or not wids:
+                if parsed.path == "/heartbeat":
+                    wids = parse_qs(parsed.query).get("worker_id", [])
+                    if not wids:
+                        self.send_response(400)
+                        self.end_headers()
+                        return
+                    worker_id = wids[0]
+                    with server_ref._lock:
+                        is_new = worker_id not in server_ref._heartbeats
+                        server_ref._heartbeats[worker_id] = time.monotonic()
+                        n = len(server_ref._heartbeats)
+                    if is_new:
+                        logger.info(f"Worker joined: {worker_id} ({n} active)")
+                    self.send_response(200)
+                    self.send_header("Content-type", "text/plain")
+                    self.end_headers()
+                    self.wfile.write(b"ok")
+                elif parsed.path == "/status":
+                    payload = json.dumps(server_ref.status()).encode()
+                    self.send_response(200)
+                    self.send_header("Content-type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(payload)
+                else:
                     self.send_response(400)
                     self.end_headers()
-                    return
-                worker_id = wids[0]
-                with server_ref._lock:
-                    is_new = worker_id not in server_ref._heartbeats
-                    server_ref._heartbeats[worker_id] = time.monotonic()
-                    n = len(server_ref._heartbeats)
-                if is_new:
-                    logger.info(
-                        f"Worker joined: {worker_id[:8]}... ({n} active)"
-                    )
-                self.send_response(200)
-                self.send_header("Content-type", "text/plain")
-                self.end_headers()
-                self.wfile.write(b"ok")
 
             def log_message(self, fmt: str, *args: Any) -> None:
                 pass  # suppress default access-log noise
 
-        self._hb_server = _IPv6HTTPServer(("", 0), _HeartbeatHandler)
+        self._hb_server = _IPv6HTTPServer(("", monitor_port), _MonitoringHandler)
         self._hb_server.daemon_threads = True
         threading.Thread(
             target=self._hb_server.serve_forever, daemon=True
         ).start()
 
+        super().__init__(port=port, store_port=store_port)
+
         # Daemon monitor that logs join/leave events and evicts stale entries
         threading.Thread(
             target=self._run_heartbeat_monitor, daemon=True
         ).start()
-        super().__init__(port=port, store_port=store_port)
 
     def heartbeat_address(self) -> str:
         """
@@ -283,6 +366,45 @@ class AsyncDiLoCoServer(ParameterServer):
         port = self._hb_server.socket.getsockname()[1]
         return f"http://{socket.gethostname()}:{port}/heartbeat"
 
+    def status_address(self) -> str:
+        """URL of the JSON status endpoint (see :meth:`status`), served on
+        the same port as the heartbeat endpoint."""
+        port = self._hb_server.socket.getsockname()[1]
+        return f"http://{socket.gethostname()}:{port}/status"
+
+    def status(self) -> Dict[str, Any]:
+        """
+        Liveness/progress snapshot for external supervisors (also served as
+        JSON at ``/status`` on the main HTTP port).
+        """
+        with self._lock:
+            now = time.monotonic()
+            cutoff = now - self._heartbeat_timeout
+            active = {
+                wid: round(now - ts, 3)
+                for wid, ts in self._heartbeats.items()
+                if ts >= cutoff
+            }
+            return {
+                "active_workers": active,  # worker_id → heartbeat staleness (s)
+                "worker_count": len(active),
+                "revision": self._revision,
+                "applied_pushes": self._applied_pushes,
+                "last_outer_step_time": self._last_step_time,
+                "dylu_pool_size": len(self._worker_speeds),
+            }
+
+    def shutdown(self) -> None:
+        """Stop both HTTP servers (session + heartbeat/status) and the
+        heartbeat monitor, releasing their threads and sockets."""
+        self._shutdown_event.set()
+        self._hb_server.shutdown()
+        self._hb_server.server_close()
+        # The session server is owned by the ParameterServer prototype, which
+        # has no teardown API; stop its serve_forever loop directly.
+        self._server.shutdown()
+        self._server.server_close()
+
     def _run_heartbeat_monitor(self) -> None:
         """
         Background daemon: evict workers whose heartbeats have expired and
@@ -290,8 +412,7 @@ class AsyncDiLoCoServer(ParameterServer):
         departures are detected within ~1.5× heartbeat_timeout of the last
         heartbeat (same trade-off as the Lighthouse eviction loop).
         """
-        while True:
-            time.sleep(self._heartbeat_timeout / 2)
+        while not self._shutdown_event.wait(self._heartbeat_timeout / 2):
             departed: List[str] = []
             with self._lock:
                 cutoff = time.monotonic() - self._heartbeat_timeout
@@ -302,7 +423,7 @@ class AsyncDiLoCoServer(ParameterServer):
                 n = len(self._heartbeats)
             for wid in departed:
                 logger.info(
-                    f"Worker departed (no heartbeat): {wid[:8]}... ({n} active)"
+                    f"Worker departed (no heartbeat): {wid} ({n} active)"
                 )
 
     def active_workers(self) -> Dict[str, float]:
@@ -327,7 +448,166 @@ class AsyncDiLoCoServer(ParameterServer):
 
     @classmethod
     def new_process_group(cls) -> ProcessGroup:
-        return ProcessGroupGloo()
+        return ProcessGroupGloo(
+            timeout=timedelta(seconds=cls.SESSION_TIMEOUT_SECONDS)
+        )
+
+    # ------------------------------------------------------------------ #
+    # Checkpointing (R3)                                                  #
+    # ------------------------------------------------------------------ #
+
+    def save_checkpoint(self, path: str) -> None:
+        """
+        Atomically persist the server's authoritative state: global model,
+        outer optimizer state, and revision. Tensors are cloned under the
+        lock; the (slow) disk write happens outside it.
+        """
+        with self._lock:
+            state = {
+                "model": {
+                    k: v.detach().clone()
+                    for k, v in self._model.state_dict().items()
+                },
+                "outer_optimizer": self._outer_optimizer.state_dict(),
+                "revision": self._revision,
+                "applied_pushes": self._applied_pushes,
+            }
+            # Optimizer state tensors are references — clone before leaving the lock
+            state["outer_optimizer"] = _clone_tensors(state["outer_optimizer"])
+        tmp = f"{path}.tmp"
+        torch.save(state, tmp)
+        os.replace(tmp, path)
+        logger.info(f"Checkpointed server state at revision {state['revision']} to {path}")
+
+    def _load_checkpoint(self, path: str) -> None:
+        state = torch.load(path, weights_only=True)
+        self._model.load_state_dict(state["model"])
+        self._outer_optimizer.load_state_dict(state["outer_optimizer"])
+        self._revision = state["revision"]
+        self._applied_pushes = state["applied_pushes"]
+        self._last_checkpoint_revision = self._revision
+        logger.info(f"Restored server state at revision {self._revision} from {path}")
+
+    def _maybe_checkpoint(self) -> None:
+        if self._checkpoint_path is None:
+            return
+        with self._lock:
+            due = (
+                self._revision - self._last_checkpoint_revision
+                >= self._checkpoint_every
+            )
+            if due:
+                # Claim before saving so concurrent sessions don't double-save
+                self._last_checkpoint_revision = self._revision
+        if due:
+            try:
+                self.save_checkpoint(self._checkpoint_path)
+            except Exception:
+                logger.exception("periodic checkpoint failed; training continues")
+
+    # ------------------------------------------------------------------ #
+    # Flat-buffer helpers (R1: one coalesced transfer per direction)      #
+    # ------------------------------------------------------------------ #
+
+    def _unflatten(self, flat: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Split one flat buffer into per-parameter views (no copies)."""
+        out: Dict[str, torch.Tensor] = {}
+        offset = 0
+        for name, shape, numel in zip(
+            self._param_names, self._param_shapes, self._param_numels
+        ):
+            out[name] = flat[offset : offset + numel].view(shape)
+            offset += numel
+        return out
+
+    def _snapshot_flat(self) -> Tuple[torch.Tensor, int]:
+        """
+        Return ``(flat_params, revision)`` for the current global model.
+
+        The snapshot is built at most once per revision and shared by all
+        concurrent sessions — the cache is invalidated whenever an outer
+        step commits.
+        """
+        with self._lock:
+            cache = self._snapshot_cache
+            if cache is not None:
+                return cache[1], cache[0]
+            snap = self._build_snapshot_locked()
+            flat = torch.cat(
+                [snap[name].detach().reshape(-1).float() for name in self._param_names]
+            )
+            self._snapshot_cache = (self._revision, flat)
+            return flat, self._revision
+
+    def _build_snapshot_locked(self) -> Dict[str, torch.Tensor]:
+        """
+        Parameters to send back to workers. Must be called with ``self._lock``
+        held. Subclasses may override (e.g. HeLoCo's look-ahead shift).
+        """
+        return {name: p.data for name, p in self._model.named_parameters()}
+
+    # ------------------------------------------------------------------ #
+    # Outer-step application                                              #
+    # ------------------------------------------------------------------ #
+
+    def _commit_step_locked(self, grads: Dict[str, torch.Tensor]) -> None:
+        """Apply one outer step. Must be called with ``self._lock`` held."""
+        with torch.no_grad():
+            for name, p in self._model.named_parameters():
+                p.grad = grads[name].to(p.dtype)
+        self._outer_optimizer.step()
+        self._outer_optimizer.zero_grad()
+        self._revision += 1
+        self._applied_pushes += 1
+        self._last_step_time = time.time()
+        self._snapshot_cache = None
+
+    def _apply_one(self, pseudo_grads: Dict[str, torch.Tensor]) -> None:
+        """
+        Apply one worker's pseudo-gradient as one outer step. Subclasses may
+        override to transform the gradient first (e.g. HeLoCo block
+        correction) as long as they end with ``_commit_step_locked``.
+        """
+        with self._lock:
+            self._commit_step_locked(pseudo_grads)
+
+    def _record_speeds_locked(self, speeds: List[float]) -> None:
+        """Add worker speeds to the DyLU pool. Must hold ``self._lock``."""
+        if self._dylu_H <= 0:
+            return
+        now = time.monotonic()
+        for spd in speeds:
+            if spd > 0:
+                self._worker_speeds.append((spd, now))
+
+    def _pool_speed_locked(self) -> float:
+        """
+        DyLU reference speed: expire stale entries, then take the configured
+        percentile of the pool (robust to a single outlier, unlike max).
+        Must hold ``self._lock``.
+        """
+        cutoff = time.monotonic() - self._dylu_timeout
+        self._worker_speeds = [
+            (s, ts) for s, ts in self._worker_speeds if ts >= cutoff
+        ]
+        if not self._worker_speeds:
+            return 0.0
+        speeds = sorted(s for s, _ in self._worker_speeds)
+        idx = math.ceil(self._dylu_percentile * (len(speeds) - 1))
+        return speeds[idx]
+
+    def _dylu_steps(self, worker_speed: float, pool_speed: float) -> int:
+        """Recommended local steps for a worker (paper Eq. 6, capped at H)."""
+        if self._dylu_H > 0 and worker_speed > 0 and pool_speed > 0:
+            return min(
+                self._dylu_H,
+                max(1, int(worker_speed / pool_speed * self._dylu_H)),
+            )
+        return self._dylu_H  # 0 → disabled
+
+    # ------------------------------------------------------------------ #
+    # Grace-period aggregation                                            #
+    # ------------------------------------------------------------------ #
 
     def _grace_accumulate_and_wait(
         self,
@@ -337,169 +617,180 @@ class AsyncDiLoCoServer(ParameterServer):
         """Accumulate pseudo-grads into the current grace window and wait.
 
         Returns ``(batch, is_processor)``.  If ``is_processor`` is True the
-        caller must:
-          1. Fill ``batch.snapshot`` and ``batch.pool_max_speed``.
-          2. Call :meth:`_grace_batch_publish` to unblock all waiting threads.
-        Non-processor threads return only after ``batch.done`` is True.
+        caller must process the batch and call :meth:`_grace_batch_publish`
+        (with an error on failure) to unblock all waiting threads. At claim
+        time the batch is detached from ``self._grace_batch`` so workers
+        arriving after the processor election open a fresh batch instead of
+        racing the processor's iteration of ``grads_list``.
+
+        Non-processor threads return only after the batch is published; they
+        must check ``batch.error``.
         """
         i_am_processor = False
         with self._grace_cond:
             now = time.monotonic()
-            if self._grace_batch is None or self._grace_batch.done:
+            if self._grace_batch is None:
                 self._grace_batch = _GraceBatch(
-                    grads_list=[{n: g.clone() for n, g in pseudo_grads.items()}],
+                    grads_list=[pseudo_grads],
                     speeds=[worker_speed],
                     deadline=now + self._grace_period,
-                    count=1,
                 )
             else:
-                self._grace_batch.grads_list.append(
-                    {n: g.clone() for n, g in pseudo_grads.items()}
-                )
+                self._grace_batch.grads_list.append(pseudo_grads)
                 self._grace_batch.speeds.append(worker_speed)
-                self._grace_batch.count += 1
 
             batch = self._grace_batch
 
-            while not batch.done:
+            while not (batch.done or batch.claimed):
                 remaining = batch.deadline - time.monotonic()
                 if remaining <= 0:
-                    if not batch.claimed:
-                        batch.claimed = True
-                        i_am_processor = True
+                    batch.claimed = True
+                    # Detach: late arrivals open a fresh batch; grads_list is
+                    # now safe for the processor to iterate without the lock.
+                    self._grace_batch = None
+                    i_am_processor = True
                     break
                 self._grace_cond.wait(timeout=remaining)
 
             # Non-processor: another thread claimed it — wait for it to publish
             if not i_am_processor:
                 while not batch.done:
-                    self._grace_cond.wait(timeout=0.005)
+                    self._grace_cond.wait()
 
         return batch, i_am_processor
 
-    def _grace_batch_publish(self, batch: _GraceBatch) -> None:
-        """Mark batch done and wake all waiting threads."""
+    def _grace_batch_publish(
+        self, batch: _GraceBatch, error: Optional[str] = None
+    ) -> None:
+        """Mark batch done (optionally with an error) and wake all waiters."""
         with self._grace_cond:
+            batch.error = error
             batch.done = True
             self._grace_cond.notify_all()
+
+    # ------------------------------------------------------------------ #
+    # Session protocol                                                    #
+    # ------------------------------------------------------------------ #
 
     @torch.profiler.record_function("async_diloco.forward")
     def forward(self, session_id: str, pg: ProcessGroup) -> None:
         """
         Handle one worker sync session.
 
-        Protocol (worker is rank 1, server is rank 0):
-          1. Worker → flag scalar: 0.0 = pull-only, 1.0 = full sync.
-          2. Worker → speed scalar: worker's steps/sec (0.0 if unknown).
-          3. If full sync: Worker → pseudo-grads (one tensor per param).
-          4. Server → updated global params (one tensor per param).
-          5. Server → new_steps scalar: DyLU-recommended local steps
-             (0.0 means DyLU disabled — worker should keep its own sync_every).
+        This is the canonical wire-protocol description; subclasses reuse it
+        unchanged and customize behavior via :meth:`_apply_one` and
+        :meth:`_build_snapshot_locked`.
+
+        Protocol (worker is rank 1, server is rank 0). All parameter data
+        moves as a single flat buffer per direction (params flattened and
+        concatenated in ``named_parameters()`` order) so a sync costs a
+        constant number of round trips instead of one per tensor:
+          1. Worker → header ``float64[3]``:
+             ``[flag (0=pull-only, 1=full sync), speed (steps/s, 0=unknown),
+             baseline_revision]``.
+          2. If full sync: Worker → flat pseudo-gradients
+             (``float16`` if ``should_quantize`` else ``float32``).
+          3. Server → header ``float64[3]``:
+             ``[new_steps (DyLU recommendation, 0=disabled), revision,
+             applied (1=push applied, 0=rejected → worker must resync)]``.
+          4. Server → flat global params (always ``float32``).
         """
-        flag = torch.zeros(1)
-        pg.broadcast_one(flag, root=1).wait()
-        is_full_sync = flag[0].item() > 0.5
+        header = torch.zeros(3, dtype=torch.float64)
+        pg.broadcast_one(header, root=1).wait()
+        is_full_sync = header[0].item() > 0.5
+        worker_speed = header[1].item()
+        baseline_revision = int(header[2].item())
 
-        speed_buf = torch.zeros(1)
-        pg.broadcast_one(speed_buf, root=1).wait()
-        worker_speed = speed_buf[0].item()
-
+        applied = False
         if is_full_sync:
-            pseudo_grads: Dict[str, torch.Tensor] = {}
-            wire_dtype = torch.float16 if self._quantize else None
-            for name, p in self._model.named_parameters():
-                if wire_dtype is not None:
-                    buf = torch.zeros(p.data.numel(), dtype=wire_dtype)
-                    pg.broadcast_one(buf, root=1).wait()
-                    pseudo_grads[name] = buf.float().view_as(p.data)
-                else:
-                    buf = torch.zeros_like(p.data)
-                    pg.broadcast_one(buf, root=1).wait()
-                    pseudo_grads[name] = buf
+            wire_dtype = torch.float16 if self._quantize else torch.float32
+            flat_grads = torch.zeros(self._total_numel, dtype=wire_dtype)
+            pg.broadcast_one(flat_grads, root=1).wait()
+            pseudo_grads = self._unflatten(
+                flat_grads.float() if self._quantize else flat_grads
+            )
 
-            if self._grace_period > 0.0:
+            with self._lock:
+                stale = baseline_revision > self._revision
+            if stale:
+                # Only possible after this server restored from an older
+                # checkpoint: the pseudo-gradient is relative to params we no
+                # longer have continuity with. Reject; the worker resyncs.
+                logger.warning(
+                    f"Rejecting push with baseline revision {baseline_revision} "
+                    f"ahead of server revision {self._revision} "
+                    "(server restored from checkpoint?)"
+                )
+                new_steps = self._dylu_H
+                snapshot_flat, revision = self._snapshot_flat()
+            elif self._grace_period > 0.0:
                 batch, i_am_processor = self._grace_accumulate_and_wait(
                     pseudo_grads, worker_speed
                 )
 
                 if i_am_processor:
-                    # Update DyLU pool once for all workers in the batch
-                    with self._lock:
-                        now = time.monotonic()
-                        cutoff = now - self._dylu_timeout
-                        for spd in batch.speeds:
-                            if self._dylu_H > 0 and spd > 0:
-                                self._worker_speeds.append((spd, now))
-                        self._worker_speeds = [
-                            (s, ts) for s, ts in self._worker_speeds if ts >= cutoff
-                        ]
-                        batch.pool_max_speed = max(
-                            (s for s, _ in self._worker_speeds), default=0.0
-                        )
-
-                    # Apply each worker's update sequentially (paper Algorithm 2:
-                    # θ ← sync(θ, w.update) for each w in arrival order)
-                    for grads in batch.grads_list:
+                    try:
+                        # Update DyLU pool once for all workers in the batch
                         with self._lock:
-                            with torch.no_grad():
-                                for name, p in self._model.named_parameters():
-                                    p.grad = grads[name]
-                            self._outer_optimizer.step()
-                            self._outer_optimizer.zero_grad()
+                            self._record_speeds_locked(batch.speeds)
+                            batch.pool_speed = self._pool_speed_locked()
 
-                    with self._lock:
-                        batch.snapshot = {
-                            name: p.detach().clone()
-                            for name, p in self._model.named_parameters()
-                        }
+                        # Apply each worker's update sequentially (paper
+                        # Algorithm 2: θ ← sync(θ, w.update) in arrival order)
+                        for grads in batch.grads_list:
+                            self._apply_one(grads)
 
+                        batch.snapshot_flat, batch.revision = self._snapshot_flat()
+                    except Exception as exc:
+                        self._grace_batch_publish(
+                            batch, error=f"{type(exc).__name__}: {exc}"
+                        )
+                        raise
                     self._grace_batch_publish(batch)
+                    self._maybe_checkpoint()
 
-                snapshot = batch.snapshot
-                if self._dylu_H > 0 and worker_speed > 0 and batch.pool_max_speed > 0:
-                    new_steps = max(
-                        1, int(worker_speed / batch.pool_max_speed * self._dylu_H)
+                if batch.error is not None:
+                    # Fail the session fast; the worker drops the push and
+                    # resyncs rather than hanging until the Gloo timeout.
+                    raise RuntimeError(
+                        f"grace batch processing failed: {batch.error}"
                     )
-                else:
-                    new_steps = self._dylu_H
+
+                applied = True
+                snapshot_flat, revision = batch.snapshot_flat, batch.revision
+                new_steps = self._dylu_steps(worker_speed, batch.pool_speed)
             else:
                 with self._lock:
-                    now = time.monotonic()
-                    if self._dylu_H > 0 and worker_speed > 0:
-                        self._worker_speeds.append((worker_speed, now))
-                    # Expire stale entries
-                    cutoff = now - self._dylu_timeout
-                    self._worker_speeds = [
-                        (spd, ts) for spd, ts in self._worker_speeds if ts >= cutoff
-                    ]
-                    if self._dylu_H > 0 and worker_speed > 0 and self._worker_speeds:
-                        max_speed = max(spd for spd, _ in self._worker_speeds)
-                        new_steps = max(1, int(worker_speed / max_speed * self._dylu_H))
-                    else:
-                        new_steps = self._dylu_H  # 0 → disabled
-
-                    with torch.no_grad():
-                        for name, p in self._model.named_parameters():
-                            p.grad = pseudo_grads[name]
-                    self._outer_optimizer.step()
-                    self._outer_optimizer.zero_grad()
-                    snapshot: Dict[str, torch.Tensor] = {
-                        name: p.detach().clone()
-                        for name, p in self._model.named_parameters()
-                    }
+                    self._record_speeds_locked([worker_speed])
+                    pool_speed = self._pool_speed_locked()
+                self._apply_one(pseudo_grads)
+                applied = True
+                snapshot_flat, revision = self._snapshot_flat()
+                new_steps = self._dylu_steps(worker_speed, pool_speed)
+                self._maybe_checkpoint()
         else:
-            with self._lock:
-                snapshot = {
-                    name: p.detach().clone()
-                    for name, p in self._model.named_parameters()
-                }
+            snapshot_flat, revision = self._snapshot_flat()
             new_steps = self._dylu_H
 
-        for name in self._param_names:
-            buf = snapshot[name].half().flatten() if self._quantize else snapshot[name]
-            pg.broadcast_one(buf, root=0).wait()
+        resp = torch.tensor(
+            [float(new_steps), float(revision), 1.0 if applied else 0.0],
+            dtype=torch.float64,
+        )
+        pg.broadcast_one(resp, root=0).wait()
+        pg.broadcast_one(snapshot_flat, root=0).wait()
 
-        pg.broadcast_one(torch.tensor([float(new_steps)]), root=0).wait()
+
+def _clone_tensors(obj: Any) -> Any:
+    """Recursively clone all tensors in a state-dict-like structure."""
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().clone()
+    if isinstance(obj, dict):
+        return {k: _clone_tensors(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_clone_tensors(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_clone_tensors(v) for v in obj)
+    return obj
 
 
 class AsyncDiLoCo:
@@ -514,6 +805,11 @@ class AsyncDiLoCo:
       4. Resets the local model to the new global parameters
 
     Workers operate fully independently — no cross-worker communication.
+
+    Fault tolerance: a failed sync never kills the training loop. The push is
+    dropped, inner training continues on the current params, and the worker
+    retries at subsequent window boundaries (with exponential backoff) using
+    a pull-only resync once the server is reachable again.
 
     Example::
 
@@ -539,6 +835,8 @@ class AsyncDiLoCo:
         heartbeat_address: Optional[str] = None,
         heartbeat_interval: float = 2.0,
         should_quantize: bool = False,
+        reset_inner_state: bool = False,
+        resync_backoff_max: float = 60.0,
     ) -> None:
         """
         Args:
@@ -562,8 +860,17 @@ class AsyncDiLoCo:
             heartbeat_interval: Seconds between heartbeat pings to the server.
                 Must be well below the server's ``heartbeat_timeout``.
                 Defaults to 2 s.
-            should_quantize: If True, transfer tensors as float16 over the wire.
-                Must match the server's ``should_quantize`` setting.
+            should_quantize: If True, upload pseudo-gradients as float16 over
+                the wire (the parameter download stays float32 — see
+                ``AsyncDiLoCoServer.should_quantize``). Must match the
+                server's setting.
+            reset_inner_state: If True, clear the inner optimizer state after
+                every sync. Standard DiLoCo persists inner AdamW state across
+                windows (that persistence is load-bearing for convergence),
+                so this defaults to False; enable only if you have evidence
+                the reset helps for your workload.
+            resync_backoff_max: Cap in seconds on the exponential backoff
+                between resync attempts while the server is unreachable.
         """
         self._server_address = server_address
         self._model = model
@@ -571,6 +878,7 @@ class AsyncDiLoCo:
         self._sync_every = sync_every
         self._fragment_update_alpha = fragment_update_alpha
         self._quantize = should_quantize
+        self._reset_inner_state = reset_inner_state
         self._local_step = 0
         self._hooks: List[Any] = []
         self._window_start: float = 0.0
@@ -581,13 +889,34 @@ class AsyncDiLoCo:
                 self._global_params[name] = p.detach().to(backup).clone()
         # Explicit ordered list so push/pull loops always match the server's order
         self._param_names: List[str] = list(self._global_params.keys())
+        self._total_numel: int = sum(
+            t.numel() for t in self._global_params.values()
+        )
+
+        # Revision of the global model our params are based on (see
+        # AsyncDiLoCoServer: lets the server detect pushes computed against a
+        # baseline it no longer has continuity with).
+        self._baseline_revision: int = 0
+
+        # Failed-sync recovery state (see _step_post_hook)
+        self._pending_resync: bool = False
+        self._resync_at: float = 0.0
+        self._resync_backoff: float = 1.0
+        self._resync_backoff_max: float = resync_backoff_max
+        # The window right after a resync started from stale params and an
+        # unusual boundary — exclude it from DyLU speed measurement.
+        self._skip_speed_report: bool = False
 
         # Heartbeat: persistent daemon thread pinging the server while in context.
         # Disabled if heartbeat_address is None.
         self._heartbeat_interval = heartbeat_interval
+        # Unique per instance (uuid, not a module counter): every worker
+        # process must register under a distinct id, hostname-prefixed for
+        # readable logs.
+        self._worker_id: str = f"{socket.gethostname()}-{uuid.uuid4().hex[:8]}"
         if heartbeat_address is not None:
             self._heartbeat_url: Optional[str] = (
-                f"{heartbeat_address}?worker_id={next(_worker_counter)}"
+                f"{heartbeat_address}?worker_id={self._worker_id}"
             )
         else:
             self._heartbeat_url = None
@@ -595,16 +924,23 @@ class AsyncDiLoCo:
         self._heartbeat_thread: Optional[threading.Thread] = None
 
     def __enter__(self) -> "AsyncDiLoCo":
-        self._initial_pull()
-        self._hooks.append(
-            self._inner_optimizer.register_step_post_hook(self._step_post_hook)
-        )
+        # Start heartbeats before the initial pull: on a large model the pull
+        # is the worker's longest silent phase and it should be visible to
+        # the server for all of it.
         if self._heartbeat_url is not None:
             self._heartbeat_stop = threading.Event()
             self._heartbeat_thread = threading.Thread(
                 target=self._run_heartbeat, daemon=True
             )
             self._heartbeat_thread.start()
+        try:
+            self._initial_pull()
+        except Exception:
+            self._stop_heartbeat()
+            raise
+        self._hooks.append(
+            self._inner_optimizer.register_step_post_hook(self._step_post_hook)
+        )
         return self
 
     def __exit__(
@@ -613,14 +949,18 @@ class AsyncDiLoCo:
         exc_value: Optional[BaseException],
         traceback: Optional[TracebackType],
     ) -> bool:
-        if self._heartbeat_stop is not None:
-            self._heartbeat_stop.set()
-        if self._heartbeat_thread is not None:
-            self._heartbeat_thread.join(timeout=self._heartbeat_interval * 2)
+        self._stop_heartbeat()
         for hook in self._hooks:
             hook.remove()
         self._hooks.clear()
         return False
+
+    def _stop_heartbeat(self) -> None:
+        if self._heartbeat_stop is not None:
+            self._heartbeat_stop.set()
+        if self._heartbeat_thread is not None:
+            self._heartbeat_thread.join(timeout=self._heartbeat_interval * 2)
+            self._heartbeat_thread = None
 
     def _run_heartbeat(self) -> None:
         """
@@ -649,10 +989,133 @@ class AsyncDiLoCo:
         _kwargs: Dict[str, Any],
     ) -> None:
         self._local_step += 1
-        if self._local_step >= self._sync_every:
-            self._sync()
-            self._local_step = 0
-            self._window_start = time.monotonic()
+        if self._local_step < self._sync_every:
+            return
+
+        if self._pending_resync:
+            # Server was unreachable on a previous boundary: the dropped
+            # push's window is gone, so just try to re-baseline (pull-only)
+            # with backoff and keep training locally in the meantime.
+            if time.monotonic() >= self._resync_at:
+                self._try_resync()
+        else:
+            try:
+                self._sync()
+            except Exception as exc:
+                # A transient server/network failure must not kill the
+                # training loop (and must not leave a half-applied push: the
+                # server may have committed our step before the return
+                # transfer failed, so the push is dropped and we re-baseline
+                # via a pull-only resync instead of retrying it).
+                logger.warning(
+                    "AsyncDiLoCo sync failed; dropping push and continuing "
+                    "local training (will resync): %s",
+                    exc,
+                )
+                self._pending_resync = True
+                self._resync_backoff = 1.0
+                self._resync_at = time.monotonic()
+
+        self._local_step = 0
+        self._window_start = time.monotonic()
+
+    def _try_resync(self) -> None:
+        """Attempt a pull-only re-baseline after a failed sync."""
+        try:
+            self._pull_global()
+        except Exception as exc:
+            self._resync_at = time.monotonic() + self._resync_backoff
+            self._resync_backoff = min(
+                self._resync_backoff * 2, self._resync_backoff_max
+            )
+            logger.warning(
+                "AsyncDiLoCo resync failed (next attempt in %.0fs): %s",
+                self._resync_at - time.monotonic(),
+                exc,
+            )
+            return
+        self._pending_resync = False
+        self._resync_backoff = 1.0
+        self._skip_speed_report = True
+        logger.info(
+            "AsyncDiLoCo resynced to server revision %d", self._baseline_revision
+        )
+
+    # ------------------------------------------------------------------ #
+    # Session plumbing                                                    #
+    # ------------------------------------------------------------------ #
+
+    def _session_roundtrip(
+        self, flag: float, speed: float, flat_grads: Optional[torch.Tensor]
+    ) -> Tuple[torch.Tensor, int, int, bool]:
+        """
+        One push/pull cycle against the server; see
+        :meth:`AsyncDiLoCoServer.forward` for the protocol.
+
+        Returns ``(flat_params, new_steps, revision, applied)``.
+        """
+        pg = AsyncDiLoCoServer.new_session(self._server_address)
+        try:
+            header = torch.tensor(
+                [flag, speed, float(self._baseline_revision)],
+                dtype=torch.float64,
+            )
+            pg.broadcast_one(header, root=1).wait()
+            if flat_grads is not None:
+                pg.broadcast_one(flat_grads, root=1).wait()
+
+            resp = torch.zeros(3, dtype=torch.float64)
+            pg.broadcast_one(resp, root=0).wait()
+            flat_params = torch.zeros(self._total_numel)
+            pg.broadcast_one(flat_params, root=0).wait()
+        finally:
+            pg.shutdown()
+
+        new_steps = int(resp[0].item())
+        revision = int(resp[1].item())
+        applied = resp[2].item() > 0.5
+        return flat_params, new_steps, revision, applied
+
+    def _adopt_global(
+        self,
+        flat_params: torch.Tensor,
+        revision: int,
+        new_steps: int,
+        blend_local: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> None:
+        """Install newly pulled global params into the model and backup."""
+        with torch.no_grad():
+            offset = 0
+            for name, p in self._model.named_parameters():
+                n = p.numel()
+                chunk = flat_params[offset : offset + n].view(p.shape)
+                offset += n
+                self._global_params[name].copy_(chunk)
+                p.data.copy_(chunk.to(p.device))
+                if blend_local is not None:
+                    p.data.lerp_(
+                        blend_local[name].to(p.device),
+                        self._fragment_update_alpha,
+                    )
+        self._baseline_revision = revision
+
+        if self._reset_inner_state:
+            # Optional deviation from DiLoCo (which persists inner state
+            # across windows); see the constructor docstring.
+            self._inner_optimizer.state.clear()
+
+        if new_steps > 0 and new_steps != self._sync_every:
+            logger.info(
+                f"AsyncDiLoCo DyLU: sync_every updated {self._sync_every} → {new_steps}"
+            )
+            self._sync_every = new_steps
+
+    def _pull_global(self) -> None:
+        """Pull current global params (flag=0) and adopt them wholesale."""
+        flat_params, new_steps, revision, _ = self._session_roundtrip(
+            flag=0.0, speed=0.0, flat_grads=None
+        )
+        self._adopt_global(flat_params, revision, new_steps)
 
     @torch.profiler.record_function("async_diloco.initial_pull")
     def _initial_pull(self) -> None:
@@ -662,37 +1125,7 @@ class AsyncDiLoCo:
         with the server's authoritative weights before the first inner window starts.
         Also receives the server's DyLU H value as the initial sync_every hint.
         """
-        pg = AsyncDiLoCoServer.new_session(self._server_address)
-        try:
-            pg.broadcast_one(torch.zeros(1), root=1).wait()  # flag=0 → pull-only
-            pg.broadcast_one(torch.zeros(1), root=1).wait()  # speed=0 (unknown)
-            new_global: Dict[str, torch.Tensor] = {}
-            for name in self._param_names:
-                ref = self._global_params[name]
-                if self._quantize:
-                    buf = torch.zeros(ref.numel(), dtype=torch.float16)
-                    pg.broadcast_one(buf, root=0).wait()
-                    new_global[name] = buf.float().view_as(ref)
-                else:
-                    buf = torch.zeros_like(ref)
-                    pg.broadcast_one(buf, root=0).wait()
-                    new_global[name] = buf
-            steps_buf = torch.zeros(1)
-            pg.broadcast_one(steps_buf, root=0).wait()
-            new_steps = int(steps_buf[0].item())
-        finally:
-            pg.shutdown()
-
-        with torch.no_grad():
-            for name, p in self._model.named_parameters():
-                self._global_params[name].copy_(new_global[name])
-                p.data.copy_(new_global[name].to(p.device))
-        # Params jumped discontinuously; stale optimizer momentum would bias
-        # the first inner window. Clear it so the window starts from a clean state.
-        self._inner_optimizer.state.clear()
-
-        if new_steps > 0:
-            self._sync_every = new_steps
+        self._pull_global()
         self._window_start = time.monotonic()
 
     @torch.profiler.record_function("async_diloco.sync")
@@ -700,68 +1133,58 @@ class AsyncDiLoCo:
         """Push pseudo-gradients to server and pull new global params.
 
         Note: the outer step is committed on the server before the response is
-        delivered. If the return broadcast fails, the server is one step ahead
-        while _global_params remains stale, making the next sync's pseudo-gradient
-        relative to the wrong baseline.
+        delivered. If the return transfer fails, the caller
+        (:meth:`_step_post_hook`) drops the push and re-baselines via a
+        pull-only resync — it never retries the push, so a committed-but-
+        unacknowledged step can't be applied twice.
         """
         logger.info(f"AsyncDiLoCo syncing after {self._sync_every} inner steps")
 
-        elapsed = time.monotonic() - self._window_start
-        speed = self._local_step / elapsed if elapsed > 0 else 0.0
+        if self._skip_speed_report:
+            speed = 0.0
+            self._skip_speed_report = False
+        else:
+            elapsed = time.monotonic() - self._window_start
+            speed = self._local_step / elapsed if elapsed > 0 else 0.0
 
         # Snapshot local params for alpha blend (only needed when alpha > 0)
         need_local = self._fragment_update_alpha > 0.0
-        pseudo_grads: Dict[str, torch.Tensor] = {}
         local_params: Dict[str, torch.Tensor] = {}
+        grad_chunks: List[torch.Tensor] = []
         with torch.no_grad():
+            # self._param_names (fixed insertion-order list) guarantees the
+            # flat layout matches the server's named_parameters() order.
             for name, p in self._model.named_parameters():
                 local_cpu = p.detach().cpu()
                 if need_local:
                     local_params[name] = local_cpu
-                pseudo_grads[name] = self._global_params[name] - local_cpu
+                grad_chunks.append(
+                    (self._global_params[name] - local_cpu).reshape(-1).float()
+                )
+        flat_grads = torch.cat(grad_chunks)
+        if self._quantize:
+            flat_grads = flat_grads.half()
 
-        # Use self._param_names (fixed insertion-order list) to guarantee the
-        # send and receive loops match the server's named_parameters() order.
-        pg = AsyncDiLoCoServer.new_session(self._server_address)
-        try:
-            pg.broadcast_one(torch.ones(1), root=1).wait()   # flag=1 → full sync
-            pg.broadcast_one(torch.tensor([speed]), root=1).wait()
-            for name in self._param_names:
-                g = pseudo_grads[name]
-                pg.broadcast_one(g.half().flatten() if self._quantize else g, root=1).wait()
+        flat_params, new_steps, revision, applied = self._session_roundtrip(
+            flag=1.0, speed=speed, flat_grads=flat_grads
+        )
 
-            new_global: Dict[str, torch.Tensor] = {}
-            for name in self._param_names:
-                ref = self._global_params[name]
-                if self._quantize:
-                    buf = torch.zeros(ref.numel(), dtype=torch.float16)
-                    pg.broadcast_one(buf, root=0).wait()
-                    new_global[name] = buf.float().view_as(ref)
-                else:
-                    buf = torch.zeros_like(ref)
-                    pg.broadcast_one(buf, root=0).wait()
-                    new_global[name] = buf
+        if not applied:
+            # Server rejected the push (stale baseline, e.g. after a server
+            # checkpoint restore): treat the response as a pure resync.
+            logger.warning(
+                "AsyncDiLoCo push rejected by server (baseline revision %d); "
+                "re-baselining to server revision %d",
+                self._baseline_revision,
+                revision,
+            )
+            self._adopt_global(flat_params, revision, new_steps)
+            self._skip_speed_report = True
+            return
 
-            steps_buf = torch.zeros(1)
-            pg.broadcast_one(steps_buf, root=0).wait()
-            new_steps = int(steps_buf[0].item())
-        finally:
-            pg.shutdown()
-
-        with torch.no_grad():
-            for name, p in self._model.named_parameters():
-                self._global_params[name].copy_(new_global[name])
-                new_val = new_global[name].to(p.device)
-                if need_local:
-                    p.data.copy_(new_val)
-                    p.data.lerp_(local_params[name].to(p.device), self._fragment_update_alpha)
-                else:
-                    p.data.copy_(new_val)
-
-        # Params jumped discontinuously; stale optimizer momentum would bias
-        # the next inner window. Clear it so the window starts from a clean state.
-        self._inner_optimizer.state.clear()
-
-        if new_steps > 0:
-            logger.info(f"AsyncDiLoCo DyLU: sync_every updated {self._sync_every} → {new_steps}")
-            self._sync_every = new_steps
+        self._adopt_global(
+            flat_params,
+            revision,
+            new_steps,
+            blend_local=local_params if need_local else None,
+        )

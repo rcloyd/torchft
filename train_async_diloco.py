@@ -6,6 +6,7 @@
 
 import logging
 import os
+import time
 
 REPLICA_GROUP_ID = int(os.environ.get("REPLICA_GROUP_ID", 0))
 os.environ["CUDA_VISIBLE_DEVICES"] = str(REPLICA_GROUP_ID % 4)
@@ -63,7 +64,6 @@ def main() -> None:
 
     if os.environ.get("SERVER_ONLY", "0") == "1":
         logger.info("SERVER_ONLY=1: set ASYNC_DILOCO_SERVER_ADDR=%s in workers", server_addr)
-        import time
         while True:
             time.sleep(3600)
 

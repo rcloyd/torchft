@@ -12,6 +12,7 @@ from torch import nn, optim
 
 from torchft.heloco import HeLoCoOptimizer, HeLoCoServer, HeLoCoWorker, block_correct
 from torchft.async_diloco import AsyncDiLoCo, AsyncDiLoCoServer
+from torchft.async_diloco_test import push_pull
 
 
 # Sequential reference for parity checks — paper Eqs. 9-15 exactly.
@@ -198,24 +199,14 @@ class TestBlockCorrectParity(TestCase):
 
 class TestHeLoCoServer(TestCase):
     def _push_pull(self, server, model, full_sync=True, pseudo_grad_value=1.0, speed=1.0):
-        addr = server.address()
-        pg = HeLoCoServer.new_session(addr)
-        try:
-            pg.broadcast_one(torch.ones(1) if full_sync else torch.zeros(1), root=1).wait()
-            pg.broadcast_one(torch.tensor([speed]), root=1).wait()
-            if full_sync:
-                for _, p in model.named_parameters():
-                    pg.broadcast_one(torch.full_like(p.data, pseudo_grad_value), root=1).wait()
-            received = {}
-            for name, p in model.named_parameters():
-                buf = torch.zeros_like(p.data)
-                pg.broadcast_one(buf, root=0).wait()
-                received[name] = buf.clone()
-            steps_buf = torch.zeros(1)
-            pg.broadcast_one(steps_buf, root=0).wait()
-            received["__new_steps__"] = steps_buf.clone()
-        finally:
-            pg.shutdown()
+        received, new_steps, _, _ = push_pull(
+            server.address(),
+            model,
+            full_sync=full_sync,
+            speed=speed,
+            grad_value=pseudo_grad_value,
+        )
+        received["__new_steps__"] = torch.tensor([float(new_steps)])
         return received
 
     def test_pull_only_sends_lookahead(self) -> None:

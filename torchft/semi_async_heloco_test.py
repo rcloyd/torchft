@@ -33,6 +33,8 @@ class SimpleModel(nn.Module):
 def create_manager() -> MagicMock:
     manager = create_autospec(Manager)
     manager.errored.return_value = None
+    # instance attribute — not captured by create_autospec's class spec
+    manager._rank0_synchronization_only = False
 
     def mock_allreduce(tensor: torch.Tensor, should_quantize: bool = False) -> Work:
         return _DummyWork(tensor)

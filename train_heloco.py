@@ -6,6 +6,7 @@
 
 import logging
 import os
+import time
 
 REPLICA_GROUP_ID = int(os.environ.get("REPLICA_GROUP_ID", 0))
 os.environ["CUDA_VISIBLE_DEVICES"] = str(REPLICA_GROUP_ID % 4)
@@ -69,7 +70,6 @@ def main() -> None:
             "SERVER_ONLY=1: set HELOCO_SERVER_ADDR=%s HELOCO_HEARTBEAT_ADDR=%s in workers",
             server_addr, hb_addr,
         )
-        import time
         while True:
             time.sleep(3600)
 

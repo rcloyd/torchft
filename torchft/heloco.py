@@ -25,8 +25,6 @@ Reference: HeLoCo paper https://arxiv.org/pdf/2606.00271.
 """
 
 import logging
-import queue
-import time
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -34,8 +32,7 @@ import torch
 import torch.profiler
 from torch import nn, optim
 
-from torchft.async_diloco import AsyncDiLoCo, AsyncDiLoCoServer, _GraceBatch
-from torchft.process_group import ProcessGroup
+from torchft.async_diloco import AsyncDiLoCo, AsyncDiLoCoServer
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -171,8 +168,11 @@ class HeLoCoServer(AsyncDiLoCoServer):
          pseudo-gradient is passed through block_correct() to align
          it with the outer momentum (Algorithm 2).
 
-    Wire protocol is identical to AsyncDiLoCoServer — no changes on
-    the worker side are required (HeLoCoWorker = AsyncDiLoCo).
+    Both modifications hook into the base class (:meth:`_apply_one` and
+    :meth:`_build_snapshot_locked`); the wire protocol is exactly
+    :meth:`AsyncDiLoCoServer.forward`, so no changes on the worker side
+    are required (HeLoCoWorker = AsyncDiLoCo). The look-ahead snapshot is
+    computed at most once per revision via the base snapshot cache.
 
     DyLU is inherited and continues to work when dylu_H > 0.
     """
@@ -181,11 +181,6 @@ class HeLoCoServer(AsyncDiLoCoServer):
         self,
         model: nn.Module,
         outer_optimizer: HeLoCoOptimizer,
-        port: int = 0,
-        store_port: int = 0,
-        dylu_H: int = 0,
-        dylu_timeout: float = 300.0,
-        heartbeat_timeout: float = 15.0,
         rho: float = 1.0,
         c_ok: float = 0.2,
         k_s: float = 0.5,
@@ -193,19 +188,12 @@ class HeLoCoServer(AsyncDiLoCoServer):
         kappa: float = 3.0,
         beta_max: float = 0.5,
         eps: float = 1e-8,
-        should_quantize: bool = False,
-        grace_period: float = 0.0,
+        **kwargs: Any,
     ) -> None:
         """
         Args:
             model: Global (outer) model on CPU.
             outer_optimizer: HeLoCoOptimizer bound to model.parameters().
-            port: HTTP port (0 = OS-assigned).
-            store_port: TCPStore port (0 = OS-assigned).
-            dylu_H: DyLU maximum local steps (0 = disabled).
-            dylu_timeout: DyLU worker expiry in seconds (default 300).
-            heartbeat_timeout: Seconds without a heartbeat before a worker
-                is considered departed (default 15).
             rho: Arrival weight ρ applied after block correction.
                  Paper recommends 1/√K for K concurrent workers.
             c_ok: Alignment threshold (default 0.2).
@@ -214,12 +202,8 @@ class HeLoCoServer(AsyncDiLoCoServer):
             kappa: Confidence factor momentum scale κ (default 3.0).
             beta_max: Shrinkage coefficient cap (default 0.5).
             eps: Numerical floor (default 1e-8).
-            should_quantize: If True, transfer parameter tensors as float16
-                over the wire. Must match the worker's ``should_quantize``
-                setting.
-            grace_period: Seconds to wait for additional workers after the
-                first pseudo-gradient arrives before applying the outer step.
-                0.0 (default) disables grace-period aggregation.
+            **kwargs: All :class:`AsyncDiLoCoServer` options (ports, hosts,
+                auth, DyLU, quantization, grace period, checkpointing, …).
         """
         # Set HeLoCo attrs before super().__init__ launches the server thread
         self._rho = rho
@@ -229,23 +213,7 @@ class HeLoCoServer(AsyncDiLoCoServer):
         self._kappa = kappa
         self._beta_max = beta_max
         self._eps = eps
-        self._lookahead_cache: Optional[Dict[str, torch.Tensor]] = None
-        # Pre-allocated grad buffers; reused across sessions to avoid page faults.
-        self._grad_buf_q: queue.Queue = queue.Queue()
-        self._grad_buf_q.put(
-            {name: torch.zeros_like(p.data) for name, p in model.named_parameters()}
-        )
-        super().__init__(
-            model=model,
-            outer_optimizer=outer_optimizer,
-            port=port,
-            store_port=store_port,
-            dylu_H=dylu_H,
-            dylu_timeout=dylu_timeout,
-            heartbeat_timeout=heartbeat_timeout,
-            should_quantize=should_quantize,
-            grace_period=grace_period,
-        )
+        super().__init__(model=model, outer_optimizer=outer_optimizer, **kwargs)
 
     @torch.profiler.record_function("heloco.lookahead_snapshot")
     def _lookahead_snapshot(self) -> Dict[str, torch.Tensor]:
@@ -278,177 +246,41 @@ class HeLoCoServer(AsyncDiLoCoServer):
 
         return snapshot
 
+    def _build_snapshot_locked(self) -> Dict[str, torch.Tensor]:
+        # Workers always receive the look-ahead position θ̄, never raw θ.
+        return self._lookahead_snapshot()
+
     @torch.profiler.record_function("heloco.apply")
-    def _heloco_apply(
-        self,
-        grads_list: List[Dict[str, torch.Tensor]],
-        speeds: List[float],
-    ) -> Tuple[Dict[str, torch.Tensor], float]:
-        """Apply HeLoCo outer steps for one or more workers' pseudo-gradients.
+    def _apply_one(self, pseudo_grads: Dict[str, torch.Tensor]) -> None:
+        """Block-correct one worker's pseudo-gradient, then commit the outer step.
 
-        For the grace-period path, ``grads_list`` contains one dict per worker
-        in arrival order; updates are applied sequentially (matching paper
-        Algorithm 2: θ ← sync(θ, w.update) for each w). For the single-worker
-        path ``grads_list`` has exactly one element.
-
-        Each step: clone momentum (brief lock) → block_correct (no lock) →
-        assign + step + zero_grad (lock). Momentum is re-cloned between
-        sequential workers so each correction uses the updated momentum.
-
-        Returns ``(lookahead_snapshot, pool_max_speed)``.
+        Clone momentum (brief lock) → block_correct (no lock) → commit (lock).
+        Sequential grace-batch workers therefore each correct against the
+        momentum updated by the previous worker's step (paper Algorithm 2
+        ordering).
         """
-        # Update DyLU pool once for all workers in this batch
         with self._lock:
-            now = time.monotonic()
-            for spd in speeds:
-                if self._dylu_H > 0 and spd > 0:
-                    self._worker_speeds.append((spd, now))
-            cutoff = now - self._dylu_timeout
-            self._worker_speeds = [
-                (s, ts) for s, ts in self._worker_speeds if ts >= cutoff
-            ]
-            pool_max_speed = max(
-                (s for s, _ in self._worker_speeds), default=0.0
-            )
-
-        # Apply each worker's update sequentially so block_correct for worker i+1
-        # uses the momentum updated by worker i's step (paper Algorithm 2 ordering)
-        for i, grads in enumerate(grads_list):
-            # Clone current momentum outside the optimizer step (brief lock)
-            with self._lock:
-                mom_bufs: Dict[str, Optional[torch.Tensor]] = {}
-                for name, p in self._model.named_parameters():
-                    state = self._outer_optimizer.state.get(p)
-                    m = state["m"] if (state and "m" in state) else None
-                    mom_bufs[name] = m.clone() if m is not None else None
-
-            # Block correction outside the lock
-            corrected = block_correct(
-                grads,
-                mom_bufs,
-                rho=self._rho,
-                c_ok=self._c_ok,
-                k_s=self._k_s,
-                k_d=self._k_d,
-                kappa=self._kappa,
-                beta_max=self._beta_max,
-                eps=self._eps,
-            )
-
-            # Apply corrected grad and step
-            with self._lock:
-                with torch.no_grad():
-                    for name, p in self._model.named_parameters():
-                        p.grad = corrected[name]
-
-                self._outer_optimizer.step()
-                self._outer_optimizer.zero_grad()
-
-                # Compute final lookahead cache after the last step
-                if i == len(grads_list) - 1:
-                    self._lookahead_cache = self._lookahead_snapshot()
-
-        return self._lookahead_cache, pool_max_speed
-
-    @torch.profiler.record_function("heloco.forward")
-    def forward(self, session_id: str, pg: ProcessGroup) -> None:
-        """
-        Handle one worker sync session with HeLoCo modifications.
-
-        Protocol (identical to AsyncDiLoCoServer — no wire changes):
-          1. Worker → flag scalar: 0.0 = pull-only, 1.0 = full sync.
-          2. Worker → speed scalar (DyLU).
-          3. If full sync: Worker → pseudo-grads (one tensor per param).
-          4. Server → look-ahead params θ̄ (one tensor per param).
-          5. Server → new_steps scalar (DyLU recommendation).
-
-        HeLoCo differences vs AsyncDiLoCoServer (server-side only):
-          - Step 5 always sends θ̄ = θ − η·μ·m, not raw θ.
-          - Full sync corrects pseudo-grads via block_correct() before
-            applying the outer step.
-        """
-        # 1. Mode flag (worker→server)
-        flag = torch.zeros(1)
-        pg.broadcast_one(flag, root=1).wait()
-        is_full_sync = flag[0].item() > 0.5
-
-        # 2. Worker speed for DyLU (worker→server)
-        speed_buf = torch.zeros(1)
-        pg.broadcast_one(speed_buf, root=1).wait()
-        worker_speed = speed_buf[0].item()
-
-        _grad_bufs: Optional[Dict[str, torch.Tensor]] = None
-        if is_full_sync:
-            # 3. Receive pseudo-gradients
-            pseudo_grads: Dict[str, torch.Tensor] = {}
-            if not self._quantize:
-                try:
-                    _grad_bufs = self._grad_buf_q.get_nowait()
-                except queue.Empty:
-                    _grad_bufs = {
-                        name: torch.zeros_like(p.data)
-                        for name, p in self._model.named_parameters()
-                    }
+            mom_bufs: Dict[str, Optional[torch.Tensor]] = {}
             for name, p in self._model.named_parameters():
-                if self._quantize:
-                    buf = torch.zeros(p.data.numel(), dtype=torch.float16)
-                    pg.broadcast_one(buf, root=1).wait()
-                    pseudo_grads[name] = buf.float().view_as(p.data)
-                else:
-                    pg.broadcast_one(_grad_bufs[name], root=1).wait()
-                    pseudo_grads[name] = _grad_bufs[name]
+                state = self._outer_optimizer.state.get(p)
+                m = state["m"] if (state and "m" in state) else None
+                mom_bufs[name] = m.clone() if m is not None else None
 
-            if self._grace_period > 0.0:
-                batch, i_am_processor = self._grace_accumulate_and_wait(
-                    pseudo_grads, worker_speed
-                )
-                # _grace_accumulate_and_wait clones grads; safe to return bufs now
-                if _grad_bufs is not None:
-                    self._grad_buf_q.put(_grad_bufs)
-                    _grad_bufs = None
+        # Block correction outside the lock
+        corrected = block_correct(
+            pseudo_grads,
+            mom_bufs,
+            rho=self._rho,
+            c_ok=self._c_ok,
+            k_s=self._k_s,
+            k_d=self._k_d,
+            kappa=self._kappa,
+            beta_max=self._beta_max,
+            eps=self._eps,
+        )
 
-                if i_am_processor:
-                    # Apply each worker's update sequentially (paper Algorithm 2)
-                    batch.snapshot, batch.pool_max_speed = self._heloco_apply(
-                        batch.grads_list, batch.speeds
-                    )
-                    self._grace_batch_publish(batch)
-
-                snapshot = batch.snapshot
-                if self._dylu_H > 0 and worker_speed > 0 and batch.pool_max_speed > 0:
-                    new_steps = max(
-                        1, int(worker_speed / batch.pool_max_speed * self._dylu_H)
-                    )
-                else:
-                    new_steps = self._dylu_H
-            else:
-                snapshot, pool_max_speed = self._heloco_apply(
-                    [pseudo_grads], [worker_speed]
-                )
-                # _heloco_apply is done with pseudo_grads; return bufs before send
-                if _grad_bufs is not None:
-                    self._grad_buf_q.put(_grad_bufs)
-                    _grad_bufs = None
-                if self._dylu_H > 0 and worker_speed > 0 and pool_max_speed > 0:
-                    new_steps = max(
-                        1, int(worker_speed / pool_max_speed * self._dylu_H)
-                    )
-                else:
-                    new_steps = self._dylu_H
-        else:  # pull-only: no outer step, just return cached look-ahead
-            with self._lock:
-                if self._lookahead_cache is None:
-                    self._lookahead_cache = self._lookahead_snapshot()
-                snapshot = self._lookahead_cache
-            new_steps = self._dylu_H
-
-        # 4. Send look-ahead params (server→worker)
-        for name in self._param_names:
-            buf = snapshot[name].half().flatten() if self._quantize else snapshot[name]
-            pg.broadcast_one(buf, root=0).wait()
-        
-        # 5. Send DyLU recommended steps (server→worker)
-        pg.broadcast_one(torch.tensor([float(new_steps)]), root=0).wait()
+        with self._lock:
+            self._commit_step_locked(corrected)
 
 
 # Workers are standard AsyncDiLoCo — all HeLoCo logic lives on the server.
