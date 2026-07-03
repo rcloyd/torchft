@@ -23,10 +23,9 @@ import threading
 import time
 import urllib.request
 import uuid
-from datetime import timedelta
 from http.server import BaseHTTPRequestHandler
 from types import TracebackType
-from typing import Any, Dict, List, Optional, Tuple, Type
+from typing import Any, BinaryIO, Dict, List, Optional, Tuple, Type
 from urllib.parse import parse_qs, urlparse
 
 import torch
@@ -34,10 +33,74 @@ import torch.profiler
 from torch import nn, optim
 
 from torchft.http import _IPv6HTTPServer
-from torchft.parameter_server import ParameterServer
-from torchft.process_group import ProcessGroup, ProcessGroupGloo
+from torchft.parameter_server import _resolve_advertise_host
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+_MAX_HEADER_BYTES: int = 1 << 16
+
+
+def _read_exact(stream: BinaryIO, nbytes: int) -> bytes:
+    """Read exactly ``nbytes`` from a stream or raise on early EOF."""
+    buf = bytearray()
+    while len(buf) < nbytes:
+        chunk = stream.read(nbytes - len(buf))
+        if not chunk:
+            raise IOError(
+                f"connection closed after {len(buf)}/{nbytes} payload bytes"
+            )
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def _tensor_to_bytes(t: torch.Tensor) -> bytes:
+    return t.detach().contiguous().cpu().numpy().tobytes()
+
+
+def _bytes_to_tensor(data: bytes, dtype: torch.dtype) -> torch.Tensor:
+    # bytearray gives torch a writable, owned buffer (frombuffer keeps a ref).
+    return torch.frombuffer(bytearray(data), dtype=dtype)
+
+
+def _quantize_int8(
+    flat: torch.Tensor, numels: List[int]
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Blockwise symmetric int8 quantization of a flat fp32 buffer, one block
+    per parameter tensor: ``scale_b = max|x_b| / 127``, ``q = round(x/scale)``.
+
+    Per-element error is bounded by ``scale_b/2 = max|x_b|/254`` — relative
+    to each block's own magnitude, following the DiLoCo int8 practice of
+    quantizing only the worker→server pseudo-gradients.
+
+    Returns ``(int8_values, fp32_scales)`` with one scale per block.
+    """
+    q = torch.empty(flat.numel(), dtype=torch.int8)
+    scales = torch.empty(len(numels), dtype=torch.float32)
+    offset = 0
+    for i, n in enumerate(numels):
+        chunk = flat[offset : offset + n]
+        scale = chunk.abs().max().item() / 127.0
+        if scale == 0.0:
+            scale = 1.0  # all-zero block: any scale round-trips to zeros
+        q[offset : offset + n] = (
+            torch.round(chunk / scale).clamp_(-127, 127).to(torch.int8)
+        )
+        scales[i] = scale
+        offset += n
+    return q, scales
+
+
+def _dequantize_int8(
+    q: torch.Tensor, scales: torch.Tensor, numels: List[int]
+) -> torch.Tensor:
+    """Inverse of :func:`_quantize_int8`."""
+    flat = torch.empty(q.numel(), dtype=torch.float32)
+    offset = 0
+    for i, n in enumerate(numels):
+        flat[offset : offset + n] = q[offset : offset + n].float() * scales[i]
+        offset += n
+    return flat
 
 
 class DelayedNesterovOptimizer(optim.Optimizer):
@@ -98,7 +161,7 @@ class DelayedNesterovOptimizer(optim.Optimizer):
         Process one worker pseudo-gradient push.
 
         Expects ``p.grad`` to be set to the worker's pseudo-gradient before
-        calling (same contract as ``AsyncDiLoCoServer.forward``).
+        calling (same contract as ``AsyncDiLoCoServer._handle_sync``).
         """
         self._push_count += 1
 
@@ -158,12 +221,12 @@ class _GraceBatch:
     pool_speed: float = 0.0                     # DyLU pool speed after step
 
 
-class AsyncDiLoCoServer(ParameterServer):
+class AsyncDiLoCoServer:
     """
     Central parameter server for AsyncDiLoCo.
 
     Stores the authoritative global model weights and outer optimizer state.
-    Each worker connects via a new HTTP session, performs one push-pull cycle:
+    Each worker performs one push-pull cycle per sync:
       1. Worker sends pseudo-gradients (outer_params - local_params)
       2. Server applies outer optimizer step
       3. Server sends updated global params back to the worker
@@ -178,30 +241,44 @@ class AsyncDiLoCoServer(ParameterServer):
     after the server restored from an older checkpoint) is rejected and the
     worker resyncs instead of silently corrupting the outer trajectory.
 
-    Deployment assumptions (inherited from the ParameterServer prototype):
-      - **Reachability**: the session data plane (Gloo) forms point-to-point
-        pairs and picks the connect direction by address comparison, so the
-        server and workers must be *bidirectionally* dialable — workers
-        behind NAT or asymmetric routing will hang during pair formation.
-        Addresses are derived from ``socket.gethostname()``, so all hosts
-        must resolve each other's hostnames.
-      - **Security**: the HTTP endpoints and the Gloo/TCPStore tensor plane
-        are unauthenticated plaintext. Run on a trusted, isolated network
-        (VPC / WireGuard or similar); anyone who can reach the ports can
-        read or poison the model.
-    """
+    **Transport**: each sync is a single worker-initiated HTTP ``POST /sync``
+    carrying length-prefixed, coalesced buffers — no per-tensor round trips
+    and no side-channel process group. Because the server never dials the
+    worker, only worker→server reachability is required (NAT'd workers work),
+    and everything (sync, heartbeat, status) is served on **one** port.
 
-    # Explicit Gloo timeout for session process groups: a dead peer parks a
-    # server thread for at most this long instead of the wrapper default.
-    SESSION_TIMEOUT_SECONDS: float = 60.0
+    Wire format (all parameter data flattened and concatenated in
+    ``named_parameters()`` order, little-endian):
+      - Request body: one JSON line
+        ``{"flag": 0|1, "speed": float, "baseline_revision": int,
+        "dtype": "float32"|"int8", "numel": int}``
+        followed, when ``flag == 1`` (full sync; ``flag == 0`` is
+        pull-only), by the raw pseudo-gradient payload:
+          - ``dtype == "float32"``: ``numel × 4`` bytes.
+          - ``dtype == "int8"`` (``should_quantize``): one fp32 scale per
+            parameter tensor (``num_params × 4`` bytes, blockwise symmetric
+            quantization) then ``numel`` int8 bytes.
+      - Response body (200): one JSON line
+        ``{"new_steps": int, "revision": int, "applied": bool, "numel": int}``
+        followed by ``numel × 4`` raw float32 bytes of the global params
+        (the download is never quantized — see ``should_quantize``).
+        Failures are plain HTTP errors (500 processing / 503 at capacity),
+        so a broken sync fails fast instead of wedging the worker.
+
+    **Security**: HTTP here is unauthenticated plaintext. Run on a trusted,
+    isolated network (VPC / WireGuard or similar); anyone who can reach the
+    port can read or poison the model.
+    """
 
     def __init__(
         self,
         model: nn.Module,
         outer_optimizer: optim.Optimizer,
         port: int = 0,
-        store_port: int = 0,
-        monitor_port: int = 0,
+        bind_host: str = "",
+        advertise_host: Optional[str] = None,
+        max_sessions: int = 128,
+        request_timeout: float = 60.0,
         dylu_H: int = 0,
         dylu_timeout: float = 300.0,
         dylu_percentile: float = 0.9,
@@ -216,12 +293,20 @@ class AsyncDiLoCoServer(ParameterServer):
             model: The global (outer) model on CPU. Its parameters are the
                 authoritative weights shared across all workers.
             outer_optimizer: Outer optimizer bound to ``model.parameters()``.
-            port: HTTP port for the session endpoint (0 = OS-assigned).
-            store_port: TCPStore port (0 = OS-assigned).
-            monitor_port: HTTP port for the heartbeat/status endpoints
-                (0 = OS-assigned). Set explicitly so the port can be
+            port: HTTP port serving /sync, /heartbeat and /status
+                (0 = OS-assigned). Set explicitly so the single port can be
                 pre-opened in firewalls / security groups and advertised
                 statically.
+            bind_host: interface to bind the HTTP server to (default: all).
+            advertise_host: hostname/IP workers use to reach this server.
+                Defaults to ``$TORCHFT_PS_ADVERTISE_HOST`` if set, otherwise
+                ``socket.gethostname()`` — set explicitly for any multi-host
+                deployment.
+            max_sessions: cap on concurrently processing sync sessions;
+                requests beyond it receive 503 so a flood of workers cannot
+                exhaust server threads/RAM.
+            request_timeout: socket timeout in seconds for each sync request;
+                a dead peer occupies a handler thread for at most this long.
             dylu_H: Maximum local steps H for Dynamic Local Updates (DyLU).
                 Per the paper (Eq. 6), each worker w is assigned
                 ``floor(v(w) / v_ref * H)`` steps (capped at H) so slower
@@ -242,11 +327,15 @@ class AsyncDiLoCoServer(ParameterServer):
                 Workers send heartbeats every ``heartbeat_interval`` seconds
                 (configured on the worker side; default 2 s). Defaults to 15 s.
             should_quantize: If True, receive worker pseudo-gradients as
-                float16 over the wire (halving upload bandwidth). The
-                server→worker parameter download always stays float32:
+                blockwise symmetric int8 over the wire (~4× upload
+                bandwidth reduction; one fp32 scale per parameter tensor,
+                per-element error ≤ ``max|Δ_b|/254`` within each block).
+                The server→worker parameter download always stays float32:
                 quantizing the authoritative params would compound error
-                into every worker's baseline each sync. Must match the
-                worker's ``should_quantize`` setting.
+                into every worker's baseline each sync — only the
+                worker→server pseudo-gradients are quantized, following the
+                DiLoCo int8 practice. Must match the worker's
+                ``should_quantize`` setting.
             grace_period: Seconds the server waits after the first worker
                 delivers pseudo-gradients before applying the outer step.
                 Workers arriving within the window have their gradients
@@ -299,21 +388,102 @@ class AsyncDiLoCoServer(ParameterServer):
         if checkpoint_path is not None and os.path.exists(checkpoint_path):
             self._load_checkpoint(checkpoint_path)
 
+        self._advertise_host: str = _resolve_advertise_host(advertise_host)
+        self._session_slots = threading.BoundedSemaphore(max_sessions)
         self._shutdown_event = threading.Event()
 
-        # Standalone HTTP server for heartbeats and the status endpoint —
-        # separate port, no changes to the shared ParameterServer prototype
-        # needed. Handler uses a closure over `self`.
         server_ref = self
 
-        class _MonitoringHandler(BaseHTTPRequestHandler):
+        class _Handler(BaseHTTPRequestHandler):
+            # Socket timeout for each request: bounds how long a dead peer
+            # can park a handler thread (R7).
+            timeout = request_timeout
+
+            def do_POST(self) -> None:
+                if urlparse(self.path).path != "/sync":
+                    self._respond(400, b"unknown path")
+                    return
+                if not server_ref._session_slots.acquire(blocking=False):
+                    self.send_response(503)
+                    self.send_header("Retry-After", "1")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                try:
+                    header = json.loads(
+                        self.rfile.readline(_MAX_HEADER_BYTES)
+                    )
+                    is_full_sync = bool(header["flag"])
+                    flat_grads: Optional[torch.Tensor] = None
+                    if is_full_sync:
+                        wire_dtype = header.get("dtype", "float32")
+                        numel = int(header["numel"])
+                        if numel != server_ref._total_numel:
+                            raise ValueError(
+                                f"pseudo-gradient numel mismatch: got {numel}, "
+                                f"expected {server_ref._total_numel}"
+                            )
+                        if wire_dtype == "int8":
+                            scales = _bytes_to_tensor(
+                                _read_exact(
+                                    self.rfile,
+                                    len(server_ref._param_numels) * 4,
+                                ),
+                                torch.float32,
+                            )
+                            q = _bytes_to_tensor(
+                                _read_exact(self.rfile, numel), torch.int8
+                            )
+                            flat_grads = _dequantize_int8(
+                                q, scales, server_ref._param_numels
+                            )
+                        elif wire_dtype == "float32":
+                            flat_grads = _bytes_to_tensor(
+                                _read_exact(self.rfile, numel * 4),
+                                torch.float32,
+                            )
+                        else:
+                            raise ValueError(
+                                f"unsupported wire dtype {wire_dtype!r}"
+                            )
+
+                    resp, snapshot_flat = server_ref._handle_sync(
+                        is_full_sync=is_full_sync,
+                        worker_speed=float(header.get("speed", 0.0)),
+                        baseline_revision=int(
+                            header.get("baseline_revision", 0)
+                        ),
+                        flat_grads=flat_grads,
+                    )
+
+                    resp["numel"] = snapshot_flat.numel()
+                    head = (json.dumps(resp) + "\n").encode()
+                    payload = _tensor_to_bytes(snapshot_flat)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Content-Length", str(len(head) + len(payload)))
+                    self.end_headers()
+                    self.wfile.write(head)
+                    self.wfile.write(payload)
+                except Exception as exc:
+                    # Fail the sync fast with a plain HTTP error: the worker
+                    # drops the push and resyncs instead of wedging.
+                    logger.exception("sync session failed")
+                    try:
+                        self._respond(
+                            500, f"{type(exc).__name__}: {exc}".encode()
+                        )
+                    except Exception:
+                        pass  # peer already gone
+                finally:
+                    server_ref._session_slots.release()
+
             def do_GET(self) -> None:
                 parsed = urlparse(self.path)
                 if parsed.path == "/heartbeat":
                     wids = parse_qs(parsed.query).get("worker_id", [])
                     if not wids:
-                        self.send_response(400)
-                        self.end_headers()
+                        self._respond(400, b"missing worker_id")
                         return
                     worker_id = wids[0]
                     with server_ref._lock:
@@ -322,39 +492,51 @@ class AsyncDiLoCoServer(ParameterServer):
                         n = len(server_ref._heartbeats)
                     if is_new:
                         logger.info(f"Worker joined: {worker_id} ({n} active)")
-                    self.send_response(200)
-                    self.send_header("Content-type", "text/plain")
-                    self.end_headers()
-                    self.wfile.write(b"ok")
+                    self._respond(200, b"ok")
                 elif parsed.path == "/status":
-                    payload = json.dumps(server_ref.status()).encode()
-                    self.send_response(200)
-                    self.send_header("Content-type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(payload)
+                    self._respond(
+                        200,
+                        json.dumps(server_ref.status()).encode(),
+                        content_type="application/json",
+                    )
                 else:
-                    self.send_response(400)
-                    self.end_headers()
+                    self._respond(400, b"unknown path")
+
+            def _respond(
+                self, code: int, body: bytes, content_type: str = "text/plain"
+            ) -> None:
+                self.send_response(code)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
 
             def log_message(self, fmt: str, *args: Any) -> None:
                 pass  # suppress default access-log noise
 
-        self._hb_server = _IPv6HTTPServer(("", monitor_port), _MonitoringHandler)
-        self._hb_server.daemon_threads = True
+        self._server = _IPv6HTTPServer((bind_host, port), _Handler)
+        self._server.daemon_threads = True
         threading.Thread(
-            target=self._hb_server.serve_forever, daemon=True
+            target=self._server.serve_forever, daemon=True
         ).start()
-
-        super().__init__(port=port, store_port=store_port)
+        logger.info(f"Started AsyncDiLoCoServer on {self.address()}")
 
         # Daemon monitor that logs join/leave events and evicts stale entries
         threading.Thread(
             target=self._run_heartbeat_monitor, daemon=True
         ).start()
 
+    def _port(self) -> int:
+        return self._server.socket.getsockname()[1]
+
+    def address(self) -> str:
+        """URL workers POST syncs to. Pass to :class:`AsyncDiLoCo`."""
+        return f"http://{self._advertise_host}:{self._port()}/sync"
+
     def heartbeat_address(self) -> str:
         """
-        Return the URL workers should send heartbeats to.
+        Return the URL workers should send heartbeats to (same port as the
+        sync endpoint — one port to open and advertise).
 
         Pass this to :class:`AsyncDiLoCo` as ``heartbeat_address``::
 
@@ -363,19 +545,16 @@ class AsyncDiLoCoServer(ParameterServer):
                              heartbeat_address=server.heartbeat_address()):
                 ...
         """
-        port = self._hb_server.socket.getsockname()[1]
-        return f"http://{socket.gethostname()}:{port}/heartbeat"
+        return f"http://{self._advertise_host}:{self._port()}/heartbeat"
 
     def status_address(self) -> str:
-        """URL of the JSON status endpoint (see :meth:`status`), served on
-        the same port as the heartbeat endpoint."""
-        port = self._hb_server.socket.getsockname()[1]
-        return f"http://{socket.gethostname()}:{port}/status"
+        """URL of the JSON status endpoint (see :meth:`status`)."""
+        return f"http://{self._advertise_host}:{self._port()}/status"
 
     def status(self) -> Dict[str, Any]:
         """
         Liveness/progress snapshot for external supervisors (also served as
-        JSON at ``/status`` on the main HTTP port).
+        JSON at ``/status``).
         """
         with self._lock:
             now = time.monotonic()
@@ -395,13 +574,9 @@ class AsyncDiLoCoServer(ParameterServer):
             }
 
     def shutdown(self) -> None:
-        """Stop both HTTP servers (session + heartbeat/status) and the
-        heartbeat monitor, releasing their threads and sockets."""
+        """Stop the HTTP server and the heartbeat monitor, releasing their
+        threads and socket."""
         self._shutdown_event.set()
-        self._hb_server.shutdown()
-        self._hb_server.server_close()
-        # The session server is owned by the ParameterServer prototype, which
-        # has no teardown API; stop its serve_forever loop directly.
         self._server.shutdown()
         self._server.server_close()
 
@@ -445,12 +620,6 @@ class AsyncDiLoCoServer(ParameterServer):
     def worker_count(self) -> int:
         """Number of workers currently sending heartbeats."""
         return len(self.active_workers())
-
-    @classmethod
-    def new_process_group(cls) -> ProcessGroup:
-        return ProcessGroupGloo(
-            timeout=timedelta(seconds=cls.SESSION_TIMEOUT_SECONDS)
-        )
 
     # ------------------------------------------------------------------ #
     # Checkpointing (R3)                                                  #
@@ -669,46 +838,31 @@ class AsyncDiLoCoServer(ParameterServer):
             self._grace_cond.notify_all()
 
     # ------------------------------------------------------------------ #
-    # Session protocol                                                    #
+    # Sync processing                                                     #
     # ------------------------------------------------------------------ #
 
-    @torch.profiler.record_function("async_diloco.forward")
-    def forward(self, session_id: str, pg: ProcessGroup) -> None:
+    @torch.profiler.record_function("async_diloco.handle_sync")
+    def _handle_sync(
+        self,
+        is_full_sync: bool,
+        worker_speed: float,
+        baseline_revision: int,
+        flat_grads: Optional[torch.Tensor],
+    ) -> Tuple[Dict[str, Any], torch.Tensor]:
         """
-        Handle one worker sync session.
+        Process one worker sync (transport-independent core; the HTTP handler
+        does the framing — see the class docstring for the wire format).
 
-        This is the canonical wire-protocol description; subclasses reuse it
-        unchanged and customize behavior via :meth:`_apply_one` and
-        :meth:`_build_snapshot_locked`.
+        Subclasses reuse this unchanged and customize behavior via
+        :meth:`_apply_one` and :meth:`_build_snapshot_locked`.
 
-        Protocol (worker is rank 1, server is rank 0). All parameter data
-        moves as a single flat buffer per direction (params flattened and
-        concatenated in ``named_parameters()`` order) so a sync costs a
-        constant number of round trips instead of one per tensor:
-          1. Worker → header ``float64[3]``:
-             ``[flag (0=pull-only, 1=full sync), speed (steps/s, 0=unknown),
-             baseline_revision]``.
-          2. If full sync: Worker → flat pseudo-gradients
-             (``float16`` if ``should_quantize`` else ``float32``).
-          3. Server → header ``float64[3]``:
-             ``[new_steps (DyLU recommendation, 0=disabled), revision,
-             applied (1=push applied, 0=rejected → worker must resync)]``.
-          4. Server → flat global params (always ``float32``).
+        Returns ``({"new_steps", "revision", "applied"}, flat_params)``.
         """
-        header = torch.zeros(3, dtype=torch.float64)
-        pg.broadcast_one(header, root=1).wait()
-        is_full_sync = header[0].item() > 0.5
-        worker_speed = header[1].item()
-        baseline_revision = int(header[2].item())
-
         applied = False
         if is_full_sync:
-            wire_dtype = torch.float16 if self._quantize else torch.float32
-            flat_grads = torch.zeros(self._total_numel, dtype=wire_dtype)
-            pg.broadcast_one(flat_grads, root=1).wait()
-            pseudo_grads = self._unflatten(
-                flat_grads.float() if self._quantize else flat_grads
-            )
+            assert flat_grads is not None
+            # The HTTP handler already dequantized to fp32.
+            pseudo_grads = self._unflatten(flat_grads)
 
             with self._lock:
                 stale = baseline_revision > self._revision
@@ -750,8 +904,8 @@ class AsyncDiLoCoServer(ParameterServer):
                     self._maybe_checkpoint()
 
                 if batch.error is not None:
-                    # Fail the session fast; the worker drops the push and
-                    # resyncs rather than hanging until the Gloo timeout.
+                    # Fail this session too (HTTP 500) so its worker drops
+                    # the push and resyncs.
                     raise RuntimeError(
                         f"grace batch processing failed: {batch.error}"
                     )
@@ -772,12 +926,10 @@ class AsyncDiLoCoServer(ParameterServer):
             snapshot_flat, revision = self._snapshot_flat()
             new_steps = self._dylu_H
 
-        resp = torch.tensor(
-            [float(new_steps), float(revision), 1.0 if applied else 0.0],
-            dtype=torch.float64,
+        return (
+            {"new_steps": new_steps, "revision": revision, "applied": applied},
+            snapshot_flat,
         )
-        pg.broadcast_one(resp, root=0).wait()
-        pg.broadcast_one(snapshot_flat, root=0).wait()
 
 
 def _clone_tensors(obj: Any) -> Any:
@@ -804,7 +956,9 @@ class AsyncDiLoCo:
       3. Pulls the updated global parameters
       4. Resets the local model to the new global parameters
 
-    Workers operate fully independently — no cross-worker communication.
+    Workers operate fully independently — no cross-worker communication. Each
+    sync is a single worker-initiated HTTP request, so only worker→server
+    reachability is required (workers may sit behind NAT).
 
     Fault tolerance: a failed sync never kills the training loop. The push is
     dropped, inner training continues on the current params, and the worker
@@ -837,6 +991,7 @@ class AsyncDiLoCo:
         should_quantize: bool = False,
         reset_inner_state: bool = False,
         resync_backoff_max: float = 60.0,
+        sync_timeout: float = 60.0,
     ) -> None:
         """
         Args:
@@ -860,8 +1015,9 @@ class AsyncDiLoCo:
             heartbeat_interval: Seconds between heartbeat pings to the server.
                 Must be well below the server's ``heartbeat_timeout``.
                 Defaults to 2 s.
-            should_quantize: If True, upload pseudo-gradients as float16 over
-                the wire (the parameter download stays float32 — see
+            should_quantize: If True, upload pseudo-gradients as blockwise
+                symmetric int8 (~4× upload bandwidth reduction; the
+                parameter download stays float32 — see
                 ``AsyncDiLoCoServer.should_quantize``). Must match the
                 server's setting.
             reset_inner_state: If True, clear the inner optimizer state after
@@ -871,6 +1027,9 @@ class AsyncDiLoCo:
                 the reset helps for your workload.
             resync_backoff_max: Cap in seconds on the exponential backoff
                 between resync attempts while the server is unreachable.
+            sync_timeout: Socket timeout in seconds for each sync request.
+                Must exceed the server's ``grace_period`` (the server holds
+                the response while aggregating the batch). Defaults to 60 s.
         """
         self._server_address = server_address
         self._model = model
@@ -879,6 +1038,7 @@ class AsyncDiLoCo:
         self._fragment_update_alpha = fragment_update_alpha
         self._quantize = should_quantize
         self._reset_inner_state = reset_inner_state
+        self._sync_timeout = sync_timeout
         self._local_step = 0
         self._hooks: List[Any] = []
         self._window_start: float = 0.0
@@ -889,9 +1049,10 @@ class AsyncDiLoCo:
                 self._global_params[name] = p.detach().to(backup).clone()
         # Explicit ordered list so push/pull loops always match the server's order
         self._param_names: List[str] = list(self._global_params.keys())
-        self._total_numel: int = sum(
+        self._param_numels: List[int] = [
             t.numel() for t in self._global_params.values()
-        )
+        ]
+        self._total_numel: int = sum(self._param_numels)
 
         # Revision of the global model our params are based on (see
         # AsyncDiLoCoServer: lets the server detect pushes computed against a
@@ -1049,32 +1210,51 @@ class AsyncDiLoCo:
         self, flag: float, speed: float, flat_grads: Optional[torch.Tensor]
     ) -> Tuple[torch.Tensor, int, int, bool]:
         """
-        One push/pull cycle against the server; see
-        :meth:`AsyncDiLoCoServer.forward` for the protocol.
+        One push/pull cycle: a single HTTP POST to the server's /sync
+        endpoint (see :class:`AsyncDiLoCoServer` for the wire format).
 
         Returns ``(flat_params, new_steps, revision, applied)``.
         """
-        pg = AsyncDiLoCoServer.new_session(self._server_address)
-        try:
-            header = torch.tensor(
-                [flag, speed, float(self._baseline_revision)],
-                dtype=torch.float64,
+        header: Dict[str, Any] = {
+            "flag": int(flag),
+            "speed": speed,
+            "baseline_revision": self._baseline_revision,
+        }
+        body = b""
+        if flat_grads is not None:
+            header["numel"] = flat_grads.numel()
+            if self._quantize:
+                q, scales = _quantize_int8(flat_grads, self._param_numels)
+                header["dtype"] = "int8"
+                body = _tensor_to_bytes(scales) + _tensor_to_bytes(q)
+            else:
+                header["dtype"] = "float32"
+                body = _tensor_to_bytes(flat_grads)
+
+        request = urllib.request.Request(
+            self._server_address,
+            data=(json.dumps(header) + "\n").encode() + body,
+            headers={"Content-Type": "application/octet-stream"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=self._sync_timeout) as resp:
+            resp_header = json.loads(resp.readline(_MAX_HEADER_BYTES))
+            numel = int(resp_header["numel"])
+            if numel != self._total_numel:
+                raise ValueError(
+                    f"global param numel mismatch: got {numel}, "
+                    f"expected {self._total_numel} — model/server mismatch?"
+                )
+            flat_params = _bytes_to_tensor(
+                _read_exact(resp, numel * 4), torch.float32
             )
-            pg.broadcast_one(header, root=1).wait()
-            if flat_grads is not None:
-                pg.broadcast_one(flat_grads, root=1).wait()
 
-            resp = torch.zeros(3, dtype=torch.float64)
-            pg.broadcast_one(resp, root=0).wait()
-            flat_params = torch.zeros(self._total_numel)
-            pg.broadcast_one(flat_params, root=0).wait()
-        finally:
-            pg.shutdown()
-
-        new_steps = int(resp[0].item())
-        revision = int(resp[1].item())
-        applied = resp[2].item() > 0.5
-        return flat_params, new_steps, revision, applied
+        return (
+            flat_params,
+            int(resp_header["new_steps"]),
+            int(resp_header["revision"]),
+            bool(resp_header["applied"]),
+        )
 
     def _adopt_global(
         self,
@@ -1162,8 +1342,6 @@ class AsyncDiLoCo:
                     (self._global_params[name] - local_cpu).reshape(-1).float()
                 )
         flat_grads = torch.cat(grad_chunks)
-        if self._quantize:
-            flat_grads = flat_grads.half()
 
         flat_params, new_steps, revision, applied = self._session_roundtrip(
             flag=1.0, speed=speed, flat_grads=flat_grads

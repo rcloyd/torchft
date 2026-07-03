@@ -13,18 +13,31 @@ This module provides a prototype implementation of a fault tolerant parameter se
 
 import json
 import logging
+import os
 import socket
 import threading
 import urllib.request
 import uuid
 from abc import ABC, abstractmethod
 from http.server import BaseHTTPRequestHandler
+from typing import Optional
 
 from torch.distributed import TCPStore
 from torchft.http import _IPv6HTTPServer
 from torchft.process_group import ProcessGroup
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+# Env var honored when the advertise_host constructor argument is None.
+ADVERTISE_HOST_ENV: str = "TORCHFT_PS_ADVERTISE_HOST"
+
+
+def _resolve_advertise_host(advertise_host: Optional[str]) -> str:
+    return (
+        advertise_host
+        or os.environ.get(ADVERTISE_HOST_ENV)
+        or socket.gethostname()
+    )
 
 
 class ParameterServer(ABC):
@@ -33,14 +46,29 @@ class ParameterServer(ABC):
     ProcessGroups.
     """
 
-    def __init__(self, port: int, store_port: int = 0) -> None:
+    def __init__(
+        self,
+        port: int,
+        store_port: int = 0,
+        bind_host: str = "",
+        advertise_host: Optional[str] = None,
+    ) -> None:
         """
         Create a new ParameterServer.
 
         Args:
             port: the port to bind the HTTP server to.
             store_port: the port to bind the TCPStore server to.
+            bind_host: the interface to bind the HTTP server to. Defaults to
+                all interfaces.
+            advertise_host: the hostname/IP workers should use to reach this
+                server, used in :meth:`address` and the TCPStore address.
+                Defaults to ``$TORCHFT_PS_ADVERTISE_HOST`` if set, otherwise
+                ``socket.gethostname()``. On cloud VMs / behind NAT the
+                default is often not resolvable by peers, so set this
+                explicitly for any multi-host deployment.
         """
+        self._advertise_host: str = _resolve_advertise_host(advertise_host)
         self.store = TCPStore(
             host_name="0.0.0.0",
             port=store_port,
@@ -69,7 +97,7 @@ class ParameterServer(ABC):
                     session_id = str(uuid.uuid4())
 
                     store_addr = (
-                        f"{socket.gethostname()}:{ps.store.port}/session/{session_id}"
+                        f"{ps._advertise_host}:{ps.store.port}/session/{session_id}"
                     )
 
                     logger.info(f"creating new session {session_id}")
@@ -100,7 +128,7 @@ class ParameterServer(ABC):
                     )
                     raise
 
-        server_address = ("", port)
+        server_address = (bind_host, port)
         self._server = _IPv6HTTPServer(server_address, RequestHandler)
         self._server.daemon_threads = True
         logger.info(f"Started ParameterServer on {self.address()}...")
@@ -122,7 +150,7 @@ class ParameterServer(ABC):
             an HTTP address
         """
         port = self._server.socket.getsockname()[1]
-        return f"http://{socket.gethostname()}:{port}/new_session"
+        return f"http://{self._advertise_host}:{port}/new_session"
 
     def _serve(self) -> None:
         try:

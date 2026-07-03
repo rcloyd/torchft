@@ -23,7 +23,9 @@ from torchft.async_diloco import (
     AsyncDiLoCo,
     AsyncDiLoCoServer,
     DelayedNesterovOptimizer,
+    _dequantize_int8,
     _GraceBatch,
+    _quantize_int8,
 )
 
 
@@ -44,28 +46,44 @@ def push_pull(
     baseline_revision: int = 0,
     quantize: bool = False,
 ) -> Tuple[Dict[str, torch.Tensor], int, int, bool]:
-    """One raw-protocol session against an AsyncDiLoCoServer (or subclass).
+    """One raw-protocol sync against an AsyncDiLoCoServer (or subclass): a
+    single HTTP POST with a JSON header line plus raw tensor bytes.
 
     Returns ``(params, new_steps, revision, applied)`` where params is the
     unflattened server response keyed by parameter name.
     """
-    pg = AsyncDiLoCoServer.new_session(addr)
-    try:
-        total = _total_numel(model)
-        header = torch.tensor(
-            [1.0 if full_sync else 0.0, speed, float(baseline_revision)],
-            dtype=torch.float64,
+    total = _total_numel(model)
+    header: Dict[str, object] = {
+        "flag": 1 if full_sync else 0,
+        "speed": speed,
+        "baseline_revision": baseline_revision,
+    }
+    body = b""
+    if full_sync:
+        flat = torch.full((total,), grad_value)
+        header["numel"] = total
+        if quantize:
+            numels = [p.numel() for _, p in model.named_parameters()]
+            q, scales = _quantize_int8(flat, numels)
+            header["dtype"] = "int8"
+            body = scales.numpy().tobytes() + q.numpy().tobytes()
+        else:
+            header["dtype"] = "float32"
+            body = flat.numpy().tobytes()
+
+    request = urllib.request.Request(
+        addr,
+        data=(json.dumps(header) + "\n").encode() + body,
+        headers={"Content-Type": "application/octet-stream"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=60) as resp:
+        resp_header = json.loads(resp.readline())
+        numel = int(resp_header["numel"])
+        flat_params = torch.frombuffer(
+            bytearray(resp.read(numel * 4)), dtype=torch.float32
         )
-        pg.broadcast_one(header, root=1).wait()
-        if full_sync:
-            flat = torch.full((total,), grad_value)
-            pg.broadcast_one(flat.half() if quantize else flat, root=1).wait()
-        resp = torch.zeros(3, dtype=torch.float64)
-        pg.broadcast_one(resp, root=0).wait()
-        flat_params = torch.zeros(total)
-        pg.broadcast_one(flat_params, root=0).wait()
-    finally:
-        pg.shutdown()
+    assert flat_params.numel() == numel
 
     params: Dict[str, torch.Tensor] = {}
     offset = 0
@@ -73,7 +91,12 @@ def push_pull(
         n = p.numel()
         params[name] = flat_params[offset : offset + n].view(p.shape).clone()
         offset += n
-    return params, int(resp[0].item()), int(resp[1].item()), resp[2].item() > 0.5
+    return (
+        params,
+        int(resp_header["new_steps"]),
+        int(resp_header["revision"]),
+        bool(resp_header["applied"]),
+    )
 
 
 class TestDelayedNesterovOptimizer(TestCase):
@@ -173,6 +196,21 @@ class TestAsyncDiLoCoServer(TestCase):
         _, _, rev2, applied2 = push_pull(server.address(), model)
         self.assertTrue(applied1 and applied2)
         self.assertEqual((rev1, rev2), (1, 2))
+
+    def test_session_cap_returns_503(self) -> None:
+        """R7: syncs beyond max_sessions get 503 instead of exhausting
+        server threads (monitoring endpoints stay available)."""
+        model = _make_model()
+        server = AsyncDiLoCoServer(
+            model, optim.SGD(model.parameters(), lr=0.1), port=0,
+            max_sessions=0,  # every sync is over capacity
+        )
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            push_pull(server.address(), model)
+        self.assertEqual(ctx.exception.code, 503)
+        # /status is unaffected by the sync session cap.
+        with urllib.request.urlopen(server.status_address()) as resp:
+            self.assertEqual(resp.status, 200)
 
     def test_stale_baseline_rejected(self) -> None:
         """A push whose baseline revision is ahead of the server (checkpoint-restore
@@ -315,6 +353,64 @@ class TestAsyncDiLoCo(TestCase):
 
         for gp, sp in zip(ref_global.parameters(), srv_model.parameters()):
             torch.testing.assert_close(sp.data, gp.data, atol=1e-6, rtol=1e-5)
+
+
+class TestInt8Quantization(TestCase):
+    """R5: upload-only blockwise symmetric int8 quantization."""
+
+    def test_roundtrip_error_bound(self) -> None:
+        """Per-element error is bounded by max|block|/254 within each block."""
+        torch.manual_seed(0)
+        numels = [64, 1, 300, 17]
+        chunks = [torch.randn(n) * scale for n, scale in zip(numels, [1.0, 100.0, 1e-4, 3.0])]
+        flat = torch.cat(chunks)
+
+        q, scales = _quantize_int8(flat, numels)
+        self.assertEqual(q.dtype, torch.int8)
+        self.assertEqual(len(scales), len(numels))
+        out = _dequantize_int8(q, scales, numels)
+
+        offset = 0
+        for n, chunk in zip(numels, chunks):
+            bound = chunk.abs().max().item() / 254.0 + 1e-7
+            err = (out[offset : offset + n] - chunk).abs().max().item()
+            self.assertLessEqual(err, bound)
+            offset += n
+
+    def test_zero_block_roundtrips_exactly(self) -> None:
+        flat = torch.zeros(10)
+        q, scales = _quantize_int8(flat, [4, 6])
+        torch.testing.assert_close(_dequantize_int8(q, scales, [4, 6]), flat)
+
+    def test_constant_block_roundtrips_exactly(self) -> None:
+        """A constant block maps to ±127 exactly — no quantization error."""
+        flat = torch.cat([torch.full((8,), 3.5), torch.full((5,), -0.25)])
+        q, scales = _quantize_int8(flat, [8, 5])
+        torch.testing.assert_close(_dequantize_int8(q, scales, [8, 5]), flat)
+
+    def test_server_applies_quantized_push(self) -> None:
+        """An int8 push with constant blocks is applied exactly like fp32."""
+        model = _make_model()
+        ref_model = _make_model()
+        ref_model.load_state_dict(model.state_dict())
+        server = AsyncDiLoCoServer(
+            model, optim.SGD(model.parameters(), lr=0.1), port=0,
+            should_quantize=True,
+        )
+        ref_server = AsyncDiLoCoServer(
+            ref_model, optim.SGD(ref_model.parameters(), lr=0.1), port=0
+        )
+
+        params_q, _, _, applied = push_pull(
+            server.address(), model, grad_value=1.0, quantize=True
+        )
+        params_ref, _, _, _ = push_pull(
+            ref_server.address(), ref_model, grad_value=1.0
+        )
+
+        self.assertTrue(applied)
+        for name in params_q:
+            torch.testing.assert_close(params_q[name], params_ref[name])
 
 
 class TestInnerOptimizerState(TestCase):
@@ -498,25 +594,21 @@ class TestGracePeriod(TestCase):
         self.assertEqual(outcome["is_processor"], False)
         self.assertEqual(outcome["error"], "RuntimeError: boom")
 
-    def test_forward_raises_on_failed_batch(self) -> None:
-        """A session whose grace batch failed must raise (killing the session)
-        so the worker drops the push and resyncs."""
+    def test_failed_batch_returns_http_error(self) -> None:
+        """A sync whose grace batch failed must get a fast HTTP 500 so the
+        worker drops the push and resyncs — no hanging until a transport
+        timeout."""
         server, model = self._make_server(grace_period=0.05)
         addr = server.address()
 
-        # Bound the client-side hang: the server session dies before sending
-        # its response, so the client's recv must fail via disconnect or the
-        # explicit session timeout rather than wedging the test.
-        old = AsyncDiLoCoServer.SESSION_TIMEOUT_SECONDS
-        AsyncDiLoCoServer.SESSION_TIMEOUT_SECONDS = 5.0
-        try:
-            with patch.object(
-                server, "_apply_one", side_effect=RuntimeError("optimizer exploded")
-            ):
-                with self.assertRaises(Exception):
-                    push_pull(addr, model, grad_value=1.0)
-        finally:
-            AsyncDiLoCoServer.SESSION_TIMEOUT_SECONDS = old
+        with patch.object(
+            server, "_apply_one", side_effect=RuntimeError("optimizer exploded")
+        ):
+            start = time.monotonic()
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                push_pull(addr, model, grad_value=1.0)
+            self.assertEqual(ctx.exception.code, 500)
+            self.assertLess(time.monotonic() - start, 30)
 
 
 class TestWorkerResilience(TestCase):
@@ -542,7 +634,7 @@ class TestWorkerResilience(TestCase):
         with trainer:
             good_addr = trainer._server_address
             # Simulate a PS outage: nothing listens here.
-            trainer._server_address = "http://127.0.0.1:9/new_session"
+            trainer._server_address = "http://127.0.0.1:9/sync"
 
             for _ in range(2):
                 step()  # boundary sync fails — must NOT raise
@@ -609,6 +701,47 @@ class TestCheckpoint(TestCase):
             self.assertFalse(os.path.exists(path + ".tmp"))
 
 
+class TestAdvertiseHost(TestCase):
+    """B4: all worker-facing addresses must honor advertise_host so
+    multi-host deployments aren't at the mercy of socket.gethostname()."""
+
+    def _make_server(self, **kwargs) -> AsyncDiLoCoServer:
+        model = _make_model()
+        return AsyncDiLoCoServer(
+            model, optim.SGD(model.parameters(), lr=0.0), port=0, **kwargs
+        )
+
+    def test_addresses_use_advertise_host(self) -> None:
+        server = self._make_server(advertise_host="ps.example.com")
+        self.assertIn("//ps.example.com:", server.address())
+        self.assertIn("//ps.example.com:", server.heartbeat_address())
+        self.assertIn("//ps.example.com:", server.status_address())
+
+    def test_env_override(self) -> None:
+        with patch.dict(os.environ, {"TORCHFT_PS_ADVERTISE_HOST": "10.1.2.3"}):
+            server = self._make_server()
+        self.assertIn("//10.1.2.3:", server.address())
+        self.assertIn("//10.1.2.3:", server.heartbeat_address())
+
+    def test_explicit_arg_beats_env(self) -> None:
+        with patch.dict(os.environ, {"TORCHFT_PS_ADVERTISE_HOST": "10.1.2.3"}):
+            server = self._make_server(advertise_host="ps.example.com")
+        self.assertIn("//ps.example.com:", server.address())
+
+    def test_advertised_sessions_work_end_to_end(self) -> None:
+        """A worker syncing via an advertised (non-gethostname) address must
+        complete a full push/pull."""
+        model = _make_model()
+        server = AsyncDiLoCoServer(
+            model, optim.SGD(model.parameters(), lr=0.1), port=0,
+            advertise_host="localhost",
+        )
+        self.assertIn("//localhost:", server.address())
+        _, _, revision, applied = push_pull(server.address(), model)
+        self.assertTrue(applied)
+        self.assertEqual(revision, 1)
+
+
 class TestStatusEndpoint(TestCase):
     def test_status_reports_progress(self) -> None:
         model = _make_model()
@@ -668,11 +801,14 @@ class TestHeartbeat(TestCase):
             time.sleep(0.3)
             self.assertEqual(server.worker_count(), 2)
 
-    def test_status_shares_heartbeat_port(self) -> None:
-        """Monitoring endpoints (/heartbeat, /status) share one server."""
+    def test_single_port_for_all_endpoints(self) -> None:
+        """R6: one port to open/advertise — /sync, /heartbeat and /status all
+        live on the same server."""
         server = self._make_server()
+        sync_port = server.address().rsplit(":", 1)[1].split("/")[0]
         hb_port = server.heartbeat_address().rsplit(":", 1)[1].split("/")[0]
         status_port = server.status_address().rsplit(":", 1)[1].split("/")[0]
+        self.assertEqual(sync_port, hb_port)
         self.assertEqual(hb_port, status_port)
 
 
@@ -759,7 +895,8 @@ class TestMultiProcess(TestCase):
         d = 4
         global_model = nn.Sequential(nn.Linear(d, d))
         server = AsyncDiLoCoServer(
-            global_model, optim.SGD(global_model.parameters(), lr=0.1), port=0
+            global_model, optim.SGD(global_model.parameters(), lr=0.1),
+            port=0, advertise_host="localhost",
         )
 
         ctx = multiprocessing.get_context("spawn")
